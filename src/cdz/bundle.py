@@ -72,28 +72,90 @@ class TopologyBundle:
     def relevant(self, fingerprint: str) -> list[int]:
         return [i for i, it in enumerate(self.items) if fingerprint in authz.relevant_signers(it.tx, self.state_before(i))]
 
-    # --- signing --------------------------------------------------------------------------
+    def diffs(self) -> list[dict]:
+        """Per item: what changes against the previous mapping with the same unique key (computed
+        from the bytes of base + items, never taken from the file's metadata)."""
+        out = []
+        for i, it in enumerate(self.items):
+            prev = authz.previous_mapping(self.state_before(i), it.tx)
+            after = topology.describe_mapping(it.tx.mapping)
+            if prev is None:
+                out.append({"new": True})
+                continue
+            before = topology.describe_mapping(prev)
+            out.append({k: {"from": before.get(k), "to": after.get(k)} for k in sorted(set(before) | set(after))
+                        if before.get(k) != after.get(k) and k != "namespace_derived_from_owners"})
+        return out
+
+    # --- signatures -----------------------------------------------------------------------
+
+    def known_keys(self, extra: dict | None = None) -> dict[str, crypto.PublicKey]:
+        keys: dict[str, crypto.PublicKey] = {}
+        for t in self.base + [it.tx for it in self.items]:
+            m = t.mapping
+            if t.kind == "namespace_delegation":
+                k = crypto.PublicKey.from_proto(m.namespace_delegation.target_key)
+                keys[k.fingerprint] = k
+            elif t.kind == "party_to_participant":
+                for kp in m.party_to_participant.party_signing_keys.keys:
+                    k = crypto.PublicKey.from_proto(kp)
+                    keys[k.fingerprint] = k
+        keys.update(extra or {})
+        return keys
+
+    def prune(self, extra: dict | None = None) -> list[str]:
+        """Drop signatures that do not verify (or cannot be verified) and duplicates per key.
+        Canton keeps only the first signature per key, so a junk one could hide a valid one."""
+        keys = self.known_keys(extra)
+        dropped: list[str] = []
+
+        def keep(sigs, data, where):
+            out, seen = [], set()
+            for sg in sigs:
+                k = keys.get(sg.signed_by)
+                if k is None or not k.verify(sg.signature, data):
+                    dropped.append(f"{where}: {'invalid' if k else 'unverifiable'} signature from {sg.signed_by[:12]}…")
+                elif sg.signed_by not in seen:
+                    seen.add(sg.signed_by)
+                    out.append(sg)
+            return out
+
+        for it in self.items:
+            it.sigs = keep(it.sigs, it.tx.hash, it.label)
+        multi = []
+        for hs, ss in self.multi:
+            ok = keep(ss, crypto.multi_tx_hash(list(hs)), "multi")
+            if ok:
+                multi.append((list(hs), ok))
+        self.multi = multi
+        return dropped
 
     def sign(self, keys: list[crypto.SigningKey], use_multi: bool = False) -> list[str]:
         """Sign every item a key can contribute to. With `use_multi`, each relevant key signs the
-        combined hash of ALL items once (what AllocateExternalParty's multiHashSignatures expects)."""
+        combined hash of ALL items once (what AllocateExternalParty's multiHashSignatures expects).
+        An existing signature of the same key is kept only if it verifies."""
         done = []
         all_hashes = [it.tx.hash for it in self.items]
+        combined = crypto.multi_tx_hash(all_hashes)
         for k in keys:
             idx = self.relevant(k.fingerprint)
             if not idx:
                 continue
             if use_multi:
-                if any(sorted(h) == sorted(all_hashes) and any(s.signed_by == k.fingerprint for s in ss) for h, ss in self.multi):
+                mine = [(h, sg) for h, ss in self.multi if sorted(h) == sorted(all_hashes) for sg in ss if sg.signed_by == k.fingerprint]
+                if any(k.public.verify(sg.signature, combined) for _, sg in mine):
                     continue
-                self.multi.append((all_hashes, [k.signature(crypto.multi_tx_hash(all_hashes))]))
+                self.multi = [(h, [sg for sg in ss if sg.signed_by != k.fingerprint]) for h, ss in self.multi]
+                self.multi = [(h, ss) for h, ss in self.multi if ss]
+                self.multi.append((all_hashes, [k.signature(combined)]))
                 done.append(f"multi[all {len(all_hashes)}] <- {k.name or k.fingerprint[:12]}")
                 continue
             for i in idx:
                 it = self.items[i]
-                if any(s.signed_by == k.fingerprint for s in it.sigs):
+                mine = [sg for sg in it.sigs if sg.signed_by == k.fingerprint]
+                if any(k.public.verify(sg.signature, it.tx.hash) for sg in mine):
                     continue
-                it.sigs.append(k.signature(it.tx.hash))
+                it.sigs = [sg for sg in it.sigs if sg.signed_by != k.fingerprint] + [k.signature(it.tx.hash)]
                 done.append(f"{it.label} <- {k.name or k.fingerprint[:12]}")
         return done
 
@@ -101,24 +163,31 @@ class TopologyBundle:
         all_hashes = sorted(it.tx.hash for it in self.items)
         return [s for h, ss in self.multi if sorted(h) == all_hashes for s in ss]
 
-    def merge(self, other: "TopologyBundle") -> int:
+    def merge(self, other: "TopologyBundle", extra: dict | None = None) -> int:
         if [it.tx.serialized for it in self.items] != [it.tx.serialized for it in other.items]:
             raise BundleError("bundles contain different transactions")
+        if [t.serialized for t in self.base] != [t.serialized for t in other.base]:
+            raise BundleError("bundles were planned against different base states")
+        other.prune(self.known_keys(extra))
         added = 0
         for a, b in zip(self.items, other.items, strict=True):
-            have = {(s.signed_by, s.signature) for s in a.sigs}
-            for s in b.sigs:
-                if (s.signed_by, s.signature) not in have:
-                    a.sigs.append(s)
+            have = {sg.signed_by for sg in a.sigs}
+            for sg in b.sigs:
+                if sg.signed_by not in have:
+                    a.sigs.append(sg)
+                    have.add(sg.signed_by)
                     added += 1
-        for h, s in other.multi:
-            if (h, s) not in self.multi:
-                self.multi.append((h, s))
-                added += len(s)
+        for h, ss in other.multi:
+            have = {sg.signed_by for hh, xs in self.multi if sorted(hh) == sorted(h) for sg in xs}
+            new = [sg for sg in ss if sg.signed_by not in have]
+            if new:
+                self.multi.append((h, new))
+                added += len(new)
         return added
 
-    def signed_transactions(self, proposal=False):
-        """`proposal`: one flag for all items, or a list with one flag per item."""
+    def signed_transactions(self, proposal=False, extra: dict | None = None):
+        """Only verified signatures are sent. `proposal`: one flag, or one flag per item."""
+        self.prune(extra)
         flags = proposal if isinstance(proposal, list) else [proposal] * len(self.items)
         return [topology.signed_tx(it.tx, it.sigs, f, self.multi_for(it.tx)) for it, f in zip(self.items, flags, strict=True)]
 
@@ -198,8 +267,12 @@ class SubmissionBundle:
 
     def verify(self, synchronizer_id: str | None = None) -> bytes:
         """Recompute the hash, require it to match the node's, check act_as/roots/intent."""
+        sync = synchronizer_id or self.synchronizer_id
+        if not sync:
+            raise BundleError("no synchronizer to check the transaction against (set CDZ_SYNCHRONIZER_ID)")
         return prepared.check(
-            self.prepared, self.scheme, self.node_hash, self.party, self.intent, synchronizer_id or self.synchronizer_id
+            self.prepared, self.scheme, self.node_hash, self.party, self.intent, sync,
+            expect_template_package=self.meta.get("expect_template_package"),
         )
 
     def sign(self, keys: list[crypto.SigningKey]) -> list[str]:
@@ -207,9 +280,11 @@ class SubmissionBundle:
         registered = {k.fingerprint for k in self.signing_keys}
         done = []
         for k in keys:
-            if k.fingerprint not in registered or any(s.signed_by == k.fingerprint for s in self.sigs):
+            if k.fingerprint not in registered:
                 continue
-            self.sigs.append(k.signature(h))
+            if any(s.signed_by == k.fingerprint and k.public.verify(s.signature, h) for s in self.sigs):
+                continue
+            self.sigs = [s for s in self.sigs if s.signed_by != k.fingerprint] + [k.signature(h)]
             done.append(k.name or k.fingerprint[:12])
         return done
 

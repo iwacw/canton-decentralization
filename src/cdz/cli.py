@@ -12,7 +12,7 @@ import re
 import sys
 from pathlib import Path
 
-from cdz import __version__, bundle, crypto, manage, prepared, topology
+from cdz import __version__, authz, bundle, crypto, manage, prepared, topology
 from cdz.config import ConfigError, Settings
 from cdz.party import Member, PartySpec
 from cdz.utilities import UtilitiesError
@@ -78,8 +78,10 @@ def sync_id(s: Settings, lc=None) -> str:
     return lc.synchronizer_id(s.synchronizer_id)
 
 
-def read_pub(path: str) -> Member:
+def read_pub(path: str, role: str | None = None) -> Member:
     d = json.loads(Path(path).read_text()) if path != "-" else json.load(sys.stdin)
+    if role and d.get("role") and d["role"] != role:
+        raise CliError(f"{path} is a {d['role']} key, expected a {role} key")
     return Member(d.get("name", Path(path).stem), crypto.PublicKey.from_json(d))
 
 
@@ -108,20 +110,25 @@ def write_bundle(b, path: str) -> None:
 
 
 def print_topology_bundle(b: bundle.TopologyBundle, party: PartySpec | None = None, strict: bool = False, file=None) -> bool:
-    """Human review of a topology bundle (stderr by default; stdout carries JSON results)."""
+    """Human review of a topology bundle (stderr by default; stdout carries JSON results).
+    Everything shown is decoded from the transaction bytes; the change summary is recomputed."""
     file = file or sys.stderr
     print = functools.partial(builtins.print, file=file)
     names = party.member_name if party else (lambda fp: fp[:12] + "…")
     print(f"{b.description}  [{b.network} {b.synchronizer_id or ''}]")
-    if b.meta.get("diff"):
-        print("change: " + json.dumps(b.meta["diff"]))
+    if b.base:
+        print(f"note: READY/MISSING and serials are computed against the {len(b.base)} base mapping(s) supplied with "
+              "the bundle; `cdz bundle show --live` checks them against the node")
     ok = True
-    for it, rep, expected in b.check(party.known_keys() if party else None, assume_participants=not strict):
+    diffs = b.diffs()
+    for (it, rep, expected), diff in zip(b.check(party.known_keys() if party else None, assume_participants=not strict), diffs, strict=True):
         d = it.tx.describe()
         status = "READY" if rep.satisfied else "MISSING"
         ok &= rep.satisfied
         print(f"\n[{it.label}] {d['mapping']} op={d['op']} serial={d['serial']} (expected {expected}) {status}")
         print(f"  hash {d['hash']}")
+        if not diff.get("new"):
+            print("  CHANGE: " + (json.dumps(diff) if diff else "none (same content as the current mapping)"))
         for k, v in d.items():
             if k not in ("mapping", "op", "serial", "hash"):
                 print(f"  {k}: {json.dumps(v)}")
@@ -129,6 +136,8 @@ def print_topology_bundle(b: bundle.TopologyBundle, party: PartySpec | None = No
             print("  signed by: " + ", ".join(names(f) for f in rep.valid_signers))
         if rep.invalid_signers:
             print("  INVALID signatures from: " + ", ".join(rep.invalid_signers))
+        if rep.unknown_signers:
+            print("  unverifiable signatures from: " + ", ".join(f[:12] + "…" for f in rep.unknown_signers))
         for m in rep.missing:
             print(f"  missing: {m}")
         for p in rep.participants:
@@ -136,6 +145,24 @@ def print_topology_bundle(b: bundle.TopologyBundle, party: PartySpec | None = No
         if d["serial"] != expected:
             print(f"  WARNING: serial {d['serial']} but the base state implies {expected}")
     return ok
+
+
+def require_network(s: Settings, b) -> None:
+    if b.network != s.network["name"]:
+        raise CliError(f"bundle is for network {b.network!r}, the selected network is {s.network['name']!r}")
+
+
+def require_party_match(s: Settings, b: bundle.SubmissionBundle) -> PartySpec:
+    """Submission bundles are checked against the local party.json, never only against themselves."""
+    p = load_party(s)
+    if b.party != p.party_id:
+        raise CliError(f"bundle is for {b.party}, party.json is {p.party_id}")
+    want = {m.key.fingerprint for m in p.signing_keys}
+    if {k.fingerprint for k in b.signing_keys} != want or b.signing_threshold != p.signing_threshold:
+        raise CliError("the bundle's signing keys/threshold differ from party.json (update party.json after checking `cdz party status`)")
+    if not s.synchronizer_id:
+        raise CliError("set CDZ_SYNCHRONIZER_ID (public) so the bundle's synchronizer can be checked")
+    return p
 
 
 # --- keys -----------------------------------------------------------------------------------
@@ -155,7 +182,7 @@ def cmd_keys_generate(args):
             raise CliError(f"{var} already exists in {p}")
         fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         with os.fdopen(fd, "a") as f:
-            f.write(line)
+            f.write(("\n" if existing and not existing.endswith("\n") else "") + line)
         os.chmod(p, 0o600)
         print(f"appended {var} to {p}", file=sys.stderr)
     elif args.print_private:
@@ -192,8 +219,10 @@ def cmd_keys_public(args):
 
 def cmd_party_new(args):
     s = settings(args)
-    owners = [read_pub(p) for p in args.owner]
-    signers = [read_pub(p) for p in args.signing_key]
+    owners = [read_pub(x, "ns") for x in args.owner]
+    signers = [read_pub(x, "tx") for x in args.signing_key]
+    if {m.key.fingerprint for m in owners} & {m.key.fingerprint for m in signers}:
+        raise CliError("use separate keys for namespace ownership and transaction signing")
     hosts = [parse_host(h) for h in args.host]
     spec = PartySpec(
         hint=args.hint,
@@ -258,6 +287,10 @@ def cmd_party_allocate(args):
     b = bundle.load(args.bundle)
     if not isinstance(b, bundle.TopologyBundle):
         raise CliError("not a topology bundle")
+    require_network(s, b)
+    pp = _party_or_none(s)
+    for note in b.prune(pp.known_keys() if pp else None):
+        print(f"dropped {note}", file=sys.stderr)
     lc = ledger(s, args.ledger_url)
     sync = b.synchronizer_id or sync_id(s, lc)
     me = lc.participant_id()
@@ -319,6 +352,10 @@ def cmd_party_status(args):
         for k in ("confirmation_threshold", "hosts", "signing_threshold", "signing_keys"):
             if want.get(k) != have.get(k):
                 drift.append(f"{k} differs from party.json")
+    delegates = authz.namespace_delegates(st, p.namespace)
+    if delegates:
+        drift.append(f"WARNING: {len(delegates)} key(s) delegated directly in the party namespace can act WITHOUT the "
+                     f"owner threshold: {', '.join(delegates)}")
     res["drift"] = drift
     out(res)
 
@@ -338,34 +375,63 @@ def cmd_bundle_show(args):
     b = bundle.load(args.file)
     if isinstance(b, bundle.TopologyBundle):
         ok = print_topology_bundle(b, _party_or_none(s), strict=args.strict, file=sys.stdout)
+        if args.live:
+            for line in live_base_check(s, b):
+                print(line)
         print("\nstatus: " + ("fully signed" if ok else "incomplete"))
     else:
-        show_submission(b, file=sys.stdout)
+        show_submission(b, file=sys.stdout, synchronizer_id=s.synchronizer_id)
+
+
+def live_base_check(s: Settings, b: bundle.TopologyBundle) -> list[str]:
+    """Compare the bundle's base state with the node's head state."""
+    namespaces, parties = set(), set()
+    for t in b.base + [it.tx for it in b.items]:
+        key = t.unique_key()
+        if key[0] == "party_to_participant":
+            parties.add(key[1])
+            namespaces.add(key[1].split("::")[1])
+        elif key[0] in ("decentralized_namespace_definition", "namespace_delegation"):
+            namespaces.add(key[1])
+    st = admin_client(s).state(b.synchronizer_id or sync_id(s), namespaces=sorted(namespaces), parties=sorted(parties))
+    out = []
+    for t in b.base:
+        live = authz.previous_mapping(st, t)
+        if live is None:
+            out.append(f"LIVE MISMATCH: base mapping {t.unique_key()[:2]} is not active on the node")
+        elif live != t.mapping or st.serials.get(t.unique_key()) != t.tx.serial:
+            out.append(f"LIVE MISMATCH: base mapping {t.unique_key()[:2]} differs from the node (serial {st.serials.get(t.unique_key())})")
+    return out or ["live check: base state matches the node"]
 
 
 def cmd_bundle_sign(args):
     s = settings(args)
     if args.output and len(args.files) > 1:
         raise CliError("-o works with a single bundle only")
-    keys = local_keys(s, args.key, args.roles)
-    if not keys:
-        raise CliError("no local keys (CDZ_NS_KEY_* / CDZ_TX_KEY_*) matched")
     for path in args.files:
         b = bundle.load(path)
+        require_network(s, b)
         if isinstance(b, bundle.TopologyBundle):
-            print_topology_bundle(b, _party_or_none(s))
+            p = _party_or_none(s)
+            for note in b.prune(p.known_keys() if p else None):
+                print(f"dropped {note}", file=sys.stderr)
+            print_topology_bundle(b, p)
+            if args.live:
+                for line in live_base_check(s, b):
+                    print(line, file=sys.stderr)
+            keys = local_keys(s, args.key, args.roles)
             relevant = [k for k in keys if b.relevant(k.fingerprint)]
             if not relevant:
                 raise CliError(f"{path}: none of the local keys is needed by this bundle")
             confirm(args, f"Sign with {', '.join(k.name for k in relevant)}?")
             done = b.sign(relevant, use_multi=args.multi)
         else:
-            p = _party_or_none(s)
-            if p and b.party != p.party_id:
-                raise CliError(f"{path}: bundle is for {b.party}, party.json is {p.party_id}")
-            if p and {k.fingerprint for k in b.signing_keys} != {m.key.fingerprint for m in p.signing_keys}:
-                print("warning: the bundle's signing keys differ from party.json (check `cdz party status`)", file=sys.stderr)
-            show_submission(b)
+            require_party_match(s, b)
+            keys = local_keys(s, args.key, "tx")  # only party signing keys sign transactions
+            if not keys:
+                raise CliError("no local party signing keys (CDZ_TX_KEY_*) matched")
+            b.verify(s.synchronizer_id)
+            show_submission(b, synchronizer_id=s.synchronizer_id)
             confirm(args, f"Sign this transaction for {b.party}?")
             done = b.sign(keys)
         for d in done:
@@ -376,9 +442,18 @@ def cmd_bundle_sign(args):
 
 
 def cmd_bundle_merge(args):
+    s = settings(args)
+    p = _party_or_none(s)
     bs = [bundle.load(f) for f in args.inputs]
     base = bs[0]
-    n = sum(base.merge(o) for o in bs[1:])
+    if isinstance(base, bundle.TopologyBundle):
+        extra = p.known_keys() if p else None
+        for note in base.prune(extra):
+            print(f"dropped {note}", file=sys.stderr)
+        n = sum(base.merge(o, extra) for o in bs[1:])
+    else:
+        n = sum(base.merge(o) for o in bs[1:])
+        base.sigs = base.valid_signatures()
     write_bundle(base, args.output)
     print(f"merged {n} signatures", file=sys.stderr)
 
@@ -389,28 +464,69 @@ def cmd_bundle_merge(args):
 def cmd_topology_submit(args):
     s = settings(args)
     b = bundle.load(args.bundle)
+    require_network(s, b)
     p = _party_or_none(s)
+    extra = p.known_keys() if p else None
+    for note in b.prune(extra):
+        print(f"dropped {note}", file=sys.stderr)
     complete = print_topology_bundle(b, p, strict=True)
     a = admin_client(s)
     sync = b.synchronizer_id or sync_id(s)
+    if s.synchronizer_id and sync != s.synchronizer_id:
+        raise CliError(f"bundle targets {sync}, CDZ_SYNCHRONIZER_ID is {s.synchronizer_id}")
     if not complete and not args.proposal:
         raise CliError("not fully authorized yet (participants and/or signers missing); pass --proposal to submit as proposal")
     confirm(args, f"Submit {len(b.items)} topology transaction(s) to {sync}?")
-    flags = [not rep.satisfied for _, rep, _ in b.check(p.known_keys() if p else None, assume_participants=False)]
-    a.add_transactions(sync, b.signed_transactions(proposal=flags), force=args.force or [])
+    flags = [not rep.satisfied for _, rep, _ in b.check(extra, assume_participants=False)]
+    a.add_transactions(sync, b.signed_transactions(proposal=flags, extra=extra), force=args.force or [])
     out({"submitted": [{"label": it.label, "hash": it.tx.hash.hex(), "proposal": f} for it, f in zip(b.items, flags, strict=True)]})
 
 
 def cmd_topology_approve(args):
-    """For a hosting participant's operator: sign with the NODE's keys via its Admin API."""
+    """For a hosting participant's operator: sign with the NODE's keys via its Admin API.
+    With --hash the pending proposal is fetched, decoded and checked before anything is signed."""
     s = settings(args)
     a = admin_client(s, args.admin_addr)
     sync = s.synchronizer_id or sync_id(s, ledger(s))
     if args.hash:
+        if not args.participant:
+            raise CliError("--hash needs --participant <this node's uid> to check what the proposal changes for it")
+        p = load_party(s)
+        me = topology.participant_uid(args.participant)
+        props = [r for r in a.party_to_participant(sync, p.party_id, proposals=True)
+                 if r.context.transaction_hash.hex() == args.hash.lower()]
+        if not props:
+            raise CliError(f"no pending PartyToParticipant proposal {args.hash} for {p.party_id}")
+        proposed = admin_item(props[0])
+        current = a.state(sync, parties=[p.party_id]).p2p.get(p.party_id)
+        serial = max(props[0].context.serial, 1)
+        tx = topology.Tx.build(topology.tpb.TopologyMapping(party_to_participant=proposed), serial)
+        base = ([topology.Tx.build(topology.tpb.TopologyMapping(party_to_participant=current), max(serial - 1, 1))]
+                if current is not None else [])
+        diff = bundle.TopologyBundle(s.network["name"], sync, "", [bundle.Item("p2p", tx)], base=base).diffs()[0]
+        print(json.dumps({"proposal": topology.describe_mapping(tx.mapping), "change": diff}, indent=2), file=sys.stderr)
+        hosts_before = {h.participant_uid: h for h in (current.participants if current else [])}
+        hosts_after = {h.participant_uid: h for h in proposed.participants}
+        if me not in hosts_after:
+            raise CliError(f"refusing: {me} is not a host in this proposal")
+        if current is None:
+            # new party: the proposal must be exactly the hosting defined in party.json
+            want, got = topology.describe_mapping(p.p2p_mapping()), topology.describe_mapping(tx.mapping)
+            norm = lambda d: {**d, "hosts": sorted(d["hosts"], key=lambda h: h["participant"]),  # noqa: E731
+                              "signing_keys": sorted(d.get("signing_keys", []))}
+            if norm(want) != norm(got):
+                raise CliError("refusing: the proposal differs from the PartyToParticipant defined in party.json")
+        else:
+            touched = {u for u in hosts_after if u not in hosts_before or hosts_after[u] != hosts_before[u]}
+            if touched - {me}:
+                raise CliError(f"refusing: the proposal must only add or change {me} (it touches {sorted(touched)})")
+            if proposed.threshold != current.threshold or authz.signing_keys_value(proposed) != authz.signing_keys_value(current):
+                raise CliError("refusing: the proposal also changes thresholds or signing keys; approve it only after review by the party owners")
         confirm(args, f"Authorize proposal {args.hash} with this node's keys?")
         t = a.authorize_hash(sync, args.hash)
     else:
         b = bundle.load(args.bundle)
+        require_network(s, b)
         it = b.items[args.index]
         print_topology_bundle(b, _party_or_none(s))
         confirm(args, f"Propose/approve [{it.label}] with this node's keys?")
@@ -420,10 +536,10 @@ def cmd_topology_approve(args):
     out({"authorized": topology.Tx(t.transaction).hash.hex(), "proposal": t.proposal})
 
 
-def _state_for_party(s, p: PartySpec):
+def _state_for_party(s, p: PartySpec, extra_namespaces=()):
     a = admin_client(s)
     sync = s.synchronizer_id or sync_id(s, ledger(s))
-    return a.state(sync, namespaces=[p.namespace], parties=[p.party_id]), sync
+    return a.state(sync, namespaces=[p.namespace, *extra_namespaces], parties=[p.party_id]), sync
 
 
 def cmd_topology_plan_party(args):
@@ -435,7 +551,7 @@ def cmd_topology_plan_party(args):
         p.party_id,
         s.network["name"],
         sync,
-        add_keys=[read_pub(x).key for x in args.add_key],
+        add_keys=[read_pub(x, "tx").key for x in args.add_key],
         remove_keys=args.remove_key,
         signing_threshold=args.signing_threshold,
         add_hosts=[parse_host(h) for h in args.add_host],
@@ -450,13 +566,14 @@ def cmd_topology_plan_party(args):
 def cmd_topology_plan_dns(args):
     s = settings(args)
     p = load_party(s)
-    st, sync = _state_for_party(s, p)
+    new_owners = [read_pub(x, "ns").key for x in args.add_owner]
+    st, sync = _state_for_party(s, p, [k.fingerprint for k in new_owners])
     b = manage.plan_dns_change(
         st,
         p.namespace,
         s.network["name"],
         sync,
-        add_owners=[read_pub(x).key for x in args.add_owner],
+        add_owners=new_owners,
         remove_owners=args.remove_owner,
         threshold=args.threshold,
     )
@@ -476,17 +593,19 @@ def cmd_topology_plan_clear_onboarding(args):
 # --- interactive submission -----------------------------------------------------------------
 
 
-def show_submission(b: bundle.SubmissionBundle, file=None) -> None:
+def show_submission(b: bundle.SubmissionBundle, file=None, synchronizer_id: str | None = None) -> None:
     file = file or sys.stderr
     print = functools.partial(builtins.print, file=file)
     try:
-        h = b.verify()
+        h = b.verify(synchronizer_id)
         verdict = f"hash verified locally: {h.hex()}"
     except Exception as e:  # show the reason, signing will refuse
         verdict = f"VERIFICATION FAILED: {e}"
     summary = prepared.summarize(b.prepared)
     print(f"{b.description or 'transaction'} for {b.party}  [{b.network}]")
     print(f"scheme {prepared.SCHEME_NAMES[b.scheme]}; {verdict}")
+    if b.scheme == prepared.SCHEMES["HASHING_SCHEME_VERSION_V2"] and b.prepared.metadata.HasField("max_record_time"):
+        print("WARNING: max_record_time is NOT covered by a V2 signature; the executing node may ignore it")
     shown = {k: v for k, v in b.meta.items() if k in ("executeBefore", "transferKind", "executed", "prepared_via")}
     if shown:
         print("meta: " + json.dumps(shown))
@@ -501,6 +620,10 @@ def prepare_bundle(s: Settings, p: PartySpec, command: dict, description: str, d
     lc = lc or ledger(s)
     sync = sync_id(s, lc)
     mrt = None
+    if ttl_s and scheme == "HASHING_SCHEME_VERSION_V2":
+        # max_record_time is only covered by the signature from hashing scheme V3 on
+        print("note: --ttl needs hashing scheme V3 to be signed; using V3", file=sys.stderr)
+        scheme = "HASHING_SCHEME_VERSION_V3"
     if ttl_s:
         mrt = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=ttl_s)).isoformat().replace("+00:00", "Z")
     r = lc.prepare(p.party_id, command, synchronizer_id=sync, disclosed=list(disclosed), max_record_time=mrt, scheme=scheme)
@@ -540,6 +663,9 @@ def finish_prepared(args, s: Settings, b: bundle.SubmissionBundle) -> None:
 
 
 def execute_bundle(s: Settings, b: bundle.SubmissionBundle, url: str | None):
+    require_network(s, b)
+    require_party_match(s, b)
+    b.verify(s.synchronizer_id)
     valid = b.valid_signatures()
     if len(valid) < b.signing_threshold:
         raise CliError(f"{len(valid)} valid signatures, threshold is {b.signing_threshold}")
@@ -569,7 +695,10 @@ def cmd_tx_prepare(args):
     else:
         raise CliError("give --command-file, --create or --exercise")
     disclosed = json.loads(Path(args.disclosed).read_text()) if args.disclosed else []
-    b = prepare_bundle(s, p, command, args.description or "", disclosed, args.ttl, f"HASHING_SCHEME_VERSION_{args.scheme.upper()}")
+    if args.ttl and args.scheme == "v2":
+        raise CliError("--ttl is not covered by a V2 signature; use --scheme v3 (or omit --scheme)")
+    scheme = args.scheme or ("v3" if args.ttl else "v2")
+    b = prepare_bundle(s, p, command, args.description or "", disclosed, args.ttl, f"HASHING_SCHEME_VERSION_{scheme.upper()}")
     finish_prepared(args, s, b)
 
 
@@ -681,12 +810,14 @@ def build_parser() -> argparse.ArgumentParser:
     p = add(bun, "show", cmd_bundle_show, "decode, re-hash and check a bundle")
     p.add_argument("file")
     p.add_argument("--strict", action="store_true", help="do not assume participant approvals")
+    p.add_argument("--live", action="store_true", help="compare the bundle's base state with the node (Admin API)")
     p = add(bun, "sign", cmd_bundle_sign, "sign with local keys (only where they are needed)")
     p.add_argument("files", nargs="+")
     p.add_argument("-o", "--output", help="write here instead of in place")
     p.add_argument("--key", action="append", help="only these key names/fingerprints")
     p.add_argument("--roles", default="ns,tx")
     p.add_argument("--multi", action="store_true", help="one signature over the combined hash of all transactions")
+    p.add_argument("--live", action="store_true", help="compare the bundle's base state with the node (Admin API)")
     yes(p)
     p = add(bun, "merge", cmd_bundle_merge, "merge signatures from several copies of a bundle")
     p.add_argument("output")
@@ -702,6 +833,7 @@ def build_parser() -> argparse.ArgumentParser:
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--hash", help="hex hash of a pending proposal")
     g.add_argument("--bundle", help="propose/approve the bundle's transaction")
+    p.add_argument("--participant", help="this node's participant uid (required with --hash)")
     p.add_argument("--index", type=int, default=0)
     p.add_argument("--admin-addr", help="Admin API of the approving node")
     yes(p)
@@ -733,7 +865,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--args", help="JSON create/choice argument")
     p.add_argument("--disclosed", help="JSON file with disclosed contracts")
     p.add_argument("--ttl", type=int, help="max record time in seconds from now")
-    p.add_argument("--scheme", choices=["v2", "v3"], default="v2")
+    p.add_argument("--scheme", choices=["v2", "v3"], help="default v2, or v3 with --ttl")
     p.add_argument("--description")
     p.add_argument("-o", "--output", default="tx.bundle.json")
     p.add_argument("--execute", action="store_true", help="sign with local keys and execute right away")

@@ -47,6 +47,10 @@ def store_id(synchronizer_id: str | None) -> cmn.StoreId:
     return cmn.StoreId(synchronizer=cmn.Synchronizer(id=synchronizer_id))
 
 
+def _removed(res) -> bool:
+    return res.context.operation == tpb.Enums.TOPOLOGY_CHANGE_OP_REMOVE
+
+
 def item(res):
     """List results carry the mapping as `item` or as the oneof `item { v30 }` (3.5)."""
     which = res.WhichOneof("item") if "item" in res.DESCRIPTOR.oneofs_by_name else None
@@ -118,7 +122,8 @@ class AdminClient:
         }
 
     def state(self, sync: str, namespaces: list[str] = (), parties: list[str] = ()) -> authz.State:
-        """Head state for the given namespaces (incl. DNS owners) and parties."""
+        """Head state for the given namespaces (incl. DNS owners) and parties. REMOVE entries only
+        advance the serial (a re-created mapping continues from it); their content is not active."""
         st = authz.State()
         seen: set[str] = set()
         todo = list(namespaces) + [p.split("::")[-1] for p in parties]
@@ -129,21 +134,31 @@ class AdminClient:
             seen.add(ns)
             for res in self.decentralized_namespaces(sync, ns):
                 d = item(res)
-                if d.decentralized_namespace == ns:
+                if d.decentralized_namespace != ns:
+                    continue
+                st.serials[("decentralized_namespace_definition", ns)] = res.context.serial
+                if not _removed(res):
                     st.dns[ns] = d
-                    st.serials[("decentralized_namespace_definition", ns)] = res.context.serial
                     todo.extend(d.owners)
             for res in self.namespace_delegations(sync, ns):
                 n = item(res)
-                if n.namespace == ns:
-                    fp = crypto.PublicKey.from_proto(n.target_key).fingerprint
+                if n.namespace != ns:
+                    continue
+                fp = crypto.PublicKey.from_proto(n.target_key).fingerprint
+                st.serials[("namespace_delegation", ns, fp)] = res.context.serial
+                if not _removed(res):
                     st.nsds[(ns, fp)] = n
-                    st.serials[("namespace_delegation", ns, fp)] = res.context.serial
+                else:
+                    st.nsds.pop((ns, fp), None)
         for party in parties:
             for res in self.party_to_participant(sync, party):
-                if item(res).party == party:
+                if item(res).party != party:
+                    continue
+                st.serials[("party_to_participant", party)] = res.context.serial
+                if not _removed(res):
                     st.p2p[party] = item(res)
-                    st.serials[("party_to_participant", party)] = res.context.serial
+                else:
+                    st.p2p.pop(party, None)
         return st
 
     # --- writes ------------------------------------------------------------------------------

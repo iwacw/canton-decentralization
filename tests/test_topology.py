@@ -185,3 +185,19 @@ def test_invalid_signature_is_reported():
     it.sigs.append(bad)
     rep = b.check()[0][1]
     assert not rep.satisfied and rep.invalid_signers == [owners[0].fingerprint]
+
+
+def test_delegation_in_dns_namespace_bypasses_threshold():
+    """Canton accepts a key delegated directly in a decentralized namespace; authz models it."""
+    spec, owners, tks = _spec()
+    st = authz.State()
+    for _, t in spec.onboarding_txs():
+        st.apply(t)
+    rogue = crypto.SigningKey.generate()
+    st.apply(Tx.build(topology.namespace_delegation(spec.namespace, rogue.public, "all-but-nsd"), 1))
+    assert authz.namespace_delegates(st, spec.namespace) == [rogue.fingerprint]
+    spec2 = PartySpec.from_json(spec.to_json())
+    spec2.signing_threshold = 3
+    tx = Tx.build(spec2.p2p_mapping(), 2)
+    assert authz.check(tx, [rogue.signature(tx.hash)], st).satisfied
+    assert rogue.fingerprint in authz.relevant_signers(tx, st)

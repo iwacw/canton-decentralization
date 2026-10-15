@@ -76,6 +76,8 @@ def plan_party_change(
         del keys[fp]
     for k in add_keys:
         keys[k.fingerprint] = k
+    if not keys:
+        raise PlanError("an external party needs at least one signing key")
     hosts = [(h.participant_uid, topology.PERMISSION_NAMES[h.permission]) for h in prev.participants]
     onboarding_now = {h.participant_uid for h in prev.participants if h.HasField("onboarding")}
     gone = {topology.participant_uid(u) for u in remove_hosts}

@@ -43,7 +43,7 @@ def value_to_py(v):
     if k in ("bool", "text", "party"):
         return getattr(v, k)
     if k == "numeric":
-        return str(Decimal(v.numeric).normalize()) if v.numeric else v.numeric
+        return format(Decimal(v.numeric).normalize(), "f") if v.numeric else v.numeric
     if k == "int64":
         return str(v.int64)
     if k == "contract_id":
@@ -73,7 +73,11 @@ def summarize(p: isp.PreparedTransaction) -> dict:
     nodes = {n.node_id: n.v1 for n in p.transaction.nodes}
 
     def node(nid: str, depth: int = 0) -> dict:
-        n = nodes[nid]
+        if depth > 32:
+            return {"truncated": nid}
+        n = nodes.get(nid)
+        if n is None:
+            return {"missing_node": nid}
         kind = n.WhichOneof("node_type")
         if kind == "create":
             c = n.create
@@ -104,7 +108,7 @@ def summarize(p: isp.PreparedTransaction) -> dict:
             f = n.fetch
             return {"fetch": tid(f.template_id), "contract_id": f.contract_id, "acting_parties": list(f.acting_parties)}
         if kind == "rollback":
-            return {"rollback": [node(c, depth + 1) for c in n.rollback.children]}
+            return {"rollback": [node(c, depth + 1) for c in n.rollback.children] if depth < 6 else f"{len(n.rollback.children)} more nodes"}
         return {kind: "…"}
 
     md = p.metadata
@@ -142,6 +146,7 @@ def check(
     intent: dict | None = None,
     synchronizer_id: str | None = None,
     clock_skew_s: int = 120,
+    expect_template_package: str | None = None,
 ) -> bytes:
     """Recompute the hash and check the transaction against what was asked. Returns the hash."""
     h = tx_hash.hash_prepared(scheme, p)
@@ -160,7 +165,7 @@ def check(
     if md.preparation_time > now_us + clock_skew_s * 1_000_000:
         raise PreparedCheckError("preparation_time is ahead of the local clock")
     if intent:
-        _check_intent(p, intent)
+        _check_intent(p, intent, expect_template_package)
     return h
 
 
@@ -177,33 +182,36 @@ def _micros(text: str) -> int | None:
 
 
 def compare_value(want, v, path: str = "$") -> list[str]:
-    """Best-effort check that a JSON (Daml-LF JSON) value matches a Ledger API Value.
+    """Check that a JSON (Daml-LF JSON) value matches a Ledger API Value.
 
-    Only what the JSON states is compared (omitted record fields are ignored); returns the
-    paths that definitely differ."""
+    Record fields the JSON omits are not compared (e.g. optional fields left out); anything that
+    cannot be compared reliably counts as a mismatch. Returns the differing paths."""
     k = v.WhichOneof("sum")
     if want is None:
         return [] if k in (None, "unit") or (k == "optional" and not v.optional.HasField("value")) else [f"{path}: expected none"]
     if k == "optional":
         return compare_value(want, v.optional.value, path) if v.optional.HasField("value") else [f"{path}: missing value"]
+    if k == "unit":
+        return [] if want == {} else [f"{path}: expected unit"]
     if k == "record":
         if not isinstance(want, dict):
             return [f"{path}: expected record"]
+        if any(not f.label for f in v.record.fields):
+            return [f"{path}: record without field labels cannot be compared"]
         fields = {f.label: f.value for f in v.record.fields}
         out = []
         for key, sub in want.items():
             if key not in fields:
-                if fields and all(fields):  # labelled record without that field
-                    out.append(f"{path}.{key}: not in transaction")
+                out.append(f"{path}.{key}: not in transaction")
                 continue
             out += compare_value(sub, fields[key], f"{path}.{key}")
         return out
     if k == "variant":
-        if isinstance(want, dict) and "tag" in want:
-            if want["tag"] != v.variant.constructor:
-                return [f"{path}: variant {v.variant.constructor} != {want['tag']}"]
-            return compare_value(want.get("value"), v.variant.value, f"{path}.{want['tag']}")
-        return []
+        if not (isinstance(want, dict) and set(want) <= {"tag", "value"} and "tag" in want):
+            return [f"{path}: expected a variant {{tag, value}}"]
+        if want["tag"] != v.variant.constructor:
+            return [f"{path}: variant {v.variant.constructor} != {want['tag']}"]
+        return compare_value(want.get("value"), v.variant.value, f"{path}.{want['tag']}")
     if k == "list":
         if not isinstance(want, list):
             return [f"{path}: expected list"]
@@ -217,6 +225,19 @@ def compare_value(want, v, path: str = "$") -> list[str]:
         if set(got) != set(want):
             return [f"{path}: keys {sorted(got)} != {sorted(want)}"]
         return [m for key in want for m in compare_value(want[key], got[key], f"{path}.{key}")]
+    if k == "gen_map":
+        if not isinstance(want, list) or any(not (isinstance(e, list) and len(e) == 2) for e in want):
+            return [f"{path}: expected a list of [key, value] pairs"]
+        entries = list(v.gen_map.entries)
+        if len(entries) != len(want):
+            return [f"{path}: {len(entries)} entries != {len(want)}"]
+        free = list(range(len(entries)))
+        for i, (wk, wv) in enumerate(want):
+            hit = next((j for j in free if not compare_value(wk, entries[j].key) and not compare_value(wv, entries[j].value)), None)
+            if hit is None:
+                return [f"{path}[{i}]: no matching entry"]
+            free.remove(hit)
+        return []
     if k == "numeric":
         try:
             return [] if Decimal(str(want)) == Decimal(v.numeric) else [f"{path}: {v.numeric} != {want}"]
@@ -226,7 +247,17 @@ def compare_value(want, v, path: str = "$") -> list[str]:
         return [] if str(want) == str(v.int64) else [f"{path}: {v.int64} != {want}"]
     if k == "timestamp":
         m = _micros(str(want))
-        return [] if m is None or m == v.timestamp else [f"{path}: timestamp differs"]
+        if m is None:
+            return [f"{path}: cannot parse timestamp {want!r}"]
+        return [] if m == v.timestamp else [f"{path}: timestamp differs"]
+    if k == "date":
+        import datetime as dt
+
+        try:
+            days = (dt.date.fromisoformat(str(want)) - dt.date(1970, 1, 1)).days
+        except ValueError:
+            return [f"{path}: cannot parse date {want!r}"]
+        return [] if days == v.date else [f"{path}: date differs"]
     if k in ("text", "party", "contract_id"):
         got = getattr(v, k)
         return [] if want == got else [f"{path}: {got!r} != {want!r}"]
@@ -234,10 +265,20 @@ def compare_value(want, v, path: str = "$") -> list[str]:
         return [] if want is v.bool else [f"{path}: {v.bool} != {want}"]
     if k == "enum":
         return [] if want == v.enum.constructor else [f"{path}: {v.enum.constructor} != {want}"]
-    return []  # date, gen_map, unit: not compared
+    return [f"{path}: cannot compare a {k} value"]
 
 
-def _check_intent(p: isp.PreparedTransaction, command: dict) -> None:
+def _package_check(want: str, package_name: str, package_id: str, what: str) -> None:
+    """`#name:Module:Entity` pins the package name; `<pkgid>:Module:Entity` pins the package id."""
+    ref = want.split(":")[0]
+    if ref.startswith("#"):
+        if package_name and package_name != ref[1:]:
+            raise PreparedCheckError(f"{what} is from package {package_name}, expected {ref[1:]}")
+    elif ref and package_id != ref:
+        raise PreparedCheckError(f"{what} is from package id {package_id}, expected {ref}")
+
+
+def _check_intent(p: isp.PreparedTransaction, command: dict, expect_template_package: str | None = None) -> None:
     """`command` is the JSON Ledger API command that was prepared ({"CreateCommand": {...}} etc.)."""
     ((cmd_kind, body),) = command.items()
     root_id = p.transaction.roots[0]
@@ -251,6 +292,7 @@ def _check_intent(p: isp.PreparedTransaction, command: dict) -> None:
         got = root.create.template_id
         if module_entity and f"{got.module_name}:{got.entity_name}" != module_entity:
             raise PreparedCheckError(f"creates {tid(got)}, expected {want}")
+        _package_check(want, root.create.package_name, got.package_id, "the created contract")
         diffs = compare_value(body.get("createArguments"), root.create.argument)
         if diffs:
             raise PreparedCheckError("create arguments differ from the request: " + "; ".join(diffs[:5]))
@@ -265,6 +307,13 @@ def _check_intent(p: isp.PreparedTransaction, command: dict) -> None:
         target = e.interface_id if e.HasField("interface_id") else e.template_id
         if module_entity and f"{target.module_name}:{target.entity_name}" != module_entity:
             raise PreparedCheckError(f"root exercises on {tid(target)}, expected {want}")
+        if e.HasField("interface_id"):
+            # the node only reports the interface's package id; pin the implementing template's package
+            _package_check(want if not want.startswith("#") else "", "", e.interface_id.package_id, "the interface")
+            if expect_template_package and e.package_name != expect_template_package:
+                raise PreparedCheckError(f"the exercised contract is from {e.package_name}, expected {expect_template_package}")
+        else:
+            _package_check(want, e.package_name, e.template_id.package_id, "the exercised contract")
         diffs = compare_value(body.get("choiceArgument"), e.chosen_value)
         if diffs:
             raise PreparedCheckError("choice argument differs from the request: " + "; ".join(diffs[:5]))

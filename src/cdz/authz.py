@@ -71,6 +71,29 @@ class State:
         return out
 
 
+def namespace_delegates(state: State, ns: str) -> list[str]:
+    """Keys delegated directly in namespace `ns`. For a decentralized namespace each of them can act
+    without the owner threshold, so their presence defeats k-of-N."""
+    return sorted(fp for (n, fp) in state.nsds if n == ns)
+
+
+def previous_mapping(state: State, tx: Tx):
+    """The active mapping `tx` replaces (same unique key), as a TopologyMapping, or None."""
+    m = tx.mapping
+    kind = tx.kind
+    if kind == "namespace_delegation":
+        n = m.namespace_delegation
+        prev = state.nsds.get((n.namespace, crypto.PublicKey.from_proto(n.target_key).fingerprint))
+        return tpb.TopologyMapping(namespace_delegation=prev) if prev is not None else None
+    if kind == "decentralized_namespace_definition":
+        prev = state.dns.get(m.decentralized_namespace_definition.decentralized_namespace)
+        return tpb.TopologyMapping(decentralized_namespace_definition=prev) if prev is not None else None
+    if kind == "party_to_participant":
+        prev = state.p2p.get(m.party_to_participant.party)
+        return tpb.TopologyMapping(party_to_participant=prev) if prev is not None else None
+    return None
+
+
 # --- requirement formulas: ("ns", namespace) | ("key", fp) | ("participant", uid) | ("and"|"or", [..])
 
 
@@ -100,7 +123,7 @@ def required(tx: Tx, state: State):
     raise ValueError(f"no authorization model for mapping {kind}")
 
 
-def _signing_keys_value(p: tpb.PartyToParticipant | None):
+def signing_keys_value(p: tpb.PartyToParticipant | None):
     if p is None or not p.HasField("party_signing_keys"):
         return None
     ks = p.party_signing_keys
@@ -120,7 +143,7 @@ def _p2p_required(tx: Tx, prev: tpb.PartyToParticipant | None):
     cur_keys = {crypto.PublicKey.from_proto(k).fingerprint for k in cur.party_signing_keys.keys}
     prev_keys = {crypto.PublicKey.from_proto(k).fingerprint for k in prev.party_signing_keys.keys} if prev else set()
     added_keys = sorted(cur_keys - prev_keys)
-    if _signing_keys_value(cur) != _signing_keys_value(prev):  # set semantics, like Canton
+    if signing_keys_value(cur) != signing_keys_value(prev):  # set semantics, like Canton
         parts.append(_and(party, *[("key", k) for k in added_keys]))
     cur_hosts = {h.participant_uid: h for h in cur.participants}
     prev_hosts = {h.participant_uid: h for h in prev.participants} if prev else {}
@@ -193,6 +216,9 @@ class _Ctx:
     def ns_ok(self, ns: str, missing: list[str]) -> bool:
         dns = self.state.dns.get(ns)
         if dns is not None:
+            # Canton also accepts a key delegated directly in the decentralized namespace
+            if any((ns, fp) in self.state.nsds and self._key_authorizes(ns, fp) for fp in self.valid):
+                return True
             ok = [o for o in sorted(set(dns.owners)) if self.ns_ok(o, [])]
             if len(ok) >= dns.threshold:
                 return True
@@ -284,6 +310,7 @@ def relevant_signers(tx: Tx, state: State) -> set[str]:
     def ns_keys(ns: str):
         d = state.dns.get(ns)
         if d is not None:
+            out.update(fp for (n, fp) in state.nsds if n == ns)  # direct delegations, if any
             for o in d.owners:
                 ns_keys(o)
             return

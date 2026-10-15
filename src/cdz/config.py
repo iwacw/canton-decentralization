@@ -52,7 +52,8 @@ def load_network(name: str) -> dict:
     if not p.is_file():
         p = NETWORKS_DIR / f"{name}.toml"
     if not p.is_file():
-        raise ConfigError(f"unknown network {name!r} (expected devnet, mainnet or a TOML path)")
+        shown = name if len(name) <= 40 and "=" not in name else "<value of CDZ_NETWORK / --network>"
+        raise ConfigError(f"unknown network {shown!r} (expected devnet, testnet, mainnet, local or a TOML path)")
     with p.open("rb") as f:
         net = tomllib.load(f)
     net.setdefault("name", p.stem)
@@ -89,7 +90,7 @@ class Settings:
     admin_ca: str | None = None
     synchronizer_id: str | None = None
     party_file: str = "party.json"
-    env: dict = field(default_factory=dict)
+    env: dict = field(default_factory=dict, repr=False)  # holds private keys: never print
 
     @classmethod
     def load(cls, env_file: str = ".env", network: str | None = None) -> "Settings":

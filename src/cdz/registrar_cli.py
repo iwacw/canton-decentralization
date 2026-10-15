@@ -243,7 +243,8 @@ def _prepare_transfer(args, s, p, lc, receiver, amount, reason, inputs, valid_fo
     factory, kind, ctx, disclosed = _registry(s).transfer_factory(p.party_id, targs)
     targs["extraArgs"] = U.extra_args(ctx)
     b = c.prepare_bundle(s, p, U.transfer(factory, targs), f"Transfer {targs['transfer']['amount']} {args.instrument} to {receiver} ({kind or 'unknown'} transfer)",
-                         disclosed, getattr(args, "ttl", None), lc=lc, meta={"executeBefore": exp, "transferKind": kind})
+                         disclosed, getattr(args, "ttl", None), lc=lc, meta={"executeBefore": exp, "transferKind": kind,
+                                                                  "expect_template_package": "utility-registry-app-v0"})
     c.write_bundle(b, out)
     return b
 
@@ -258,14 +259,18 @@ def cmd_transfer(args):
 
 
 def read_transfer_csv(path: str) -> list[dict]:
+    from cdz import topology
+
     rows = []
-    with open(path, newline="") as f:
+    with open(path, newline="", encoding="utf-8-sig") as f:  # tolerate an Excel BOM
         for i, r in enumerate(csv.DictReader(f), start=2):
             r = {k.strip().lower(): (v or "").strip() for k, v in r.items() if k}
             if not r.get("receiver") or not r.get("amount"):
                 raise U.UtilitiesError(f"{path}:{i}: receiver and amount are required")
-            if "::" not in r["receiver"]:
-                raise U.UtilitiesError(f"{path}:{i}: receiver is not a party id")
+            try:
+                topology.split_uid(r["receiver"])
+            except topology.TopologyError:
+                raise U.UtilitiesError(f"{path}:{i}: receiver is not a party id") from None
             rows.append({"line": i, "receiver": r["receiver"], "amount": U.decimal(r["amount"]), "reason": r.get("reason") or None})
     if not rows:
         raise U.UtilitiesError(f"{path}: no rows")
@@ -285,58 +290,113 @@ def assign_exact_holdings(rows: list[dict], holdings: list[dict]) -> dict[int, s
     return out
 
 
+def _safe(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]", "_", name)[:24] or "party"
+
+
+def _bundle_state(path: str | None) -> str | None:
+    """executed | prepared | None (no bundle file)."""
+    from cdz import bundle
+
+    if not path or not Path(path).exists():
+        return None
+    return "executed" if bundle.load(path).meta.get("executed") else "prepared"
+
+
 def cmd_transfers(args):
-    """Batch from CSV (receiver,amount[,reason]). Each transfer is its own transaction with its own
-    exact-amount input holding, so all bundles can be signed offline in one go without conflicts."""
+    """Batch from CSV (receiver,amount[,reason]), resumable. Each transfer is its own transaction
+    with its own exact-amount input holding, so the bundles can be signed offline in one go.
+    Progress lives in <out-dir>/manifest.json and each bundle's `executed` mark: a rerun never
+    prepares or executes a line twice."""
+    from cdz import bundle
+
     c, s, p = _ctx(args)
     lc = c.ledger(s)
     rows = read_transfer_csv(args.csv)
     outdir = Path(args.out_dir)
     outdir.mkdir(parents=True, exist_ok=True)
-    mine = [h for h in _holdings(lc, p.party_id) if h["owner"] == p.party_id and h["admin"] == p.party_id
-            and h["instrument"] == args.instrument and not h["locked"]]
-    assignment = assign_exact_holdings(rows, mine)
-    if assignment is None:
-        if getattr(args, "_after_split", False):
-            raise U.UtilitiesError("exact-amount holdings are not visible yet after the split/merge; rerun in a moment")
-        total = sum(Decimal(r["amount"]) for r in rows)
-        big = sorted(mine, key=lambda h: Decimal(h["amount"]), reverse=True)
-        if not big or Decimal(big[0]["amount"]) < total:
-            have = sum(Decimal(h["amount"]) for h in mine)
-            if have < total:
-                raise U.UtilitiesError(f"registrar holds {have} unlocked {args.instrument}, CSV needs {total}")
-            b = c.prepare_bundle(s, p, U.holding_merge(big[0]["contract_id"], [h["contract_id"] for h in big[1:]]),
-                                 f"Merge {len(big)} holdings of {args.instrument} before splitting", lc=lc)
-            c.write_bundle(b, outdir / "00-merge.json")
-            print("step 1/3: sign+execute 00-merge.json, then rerun this command", file=sys.stderr)
-        else:
-            b = c.prepare_bundle(s, p, U.holding_split(big[0]["contract_id"], [r["amount"] for r in rows]),
-                                 f"Split {big[0]['amount']} {args.instrument} into {len(rows)} exact amounts for the CSV", lc=lc)
-            c.write_bundle(b, outdir / "00-split.json")
-            print("step 2/3: sign+execute 00-split.json, then rerun this command to prepare the transfers", file=sys.stderr)
-        if args.execute:
+    mpath = outdir / "manifest.json"
+    manifest = {e["line"]: e for e in json.loads(mpath.read_text())} if mpath.exists() else {}
+    for r in rows:
+        e = manifest.get(r["line"])
+        if e and (e["receiver"] != r["receiver"] or Decimal(e["amount"]) != Decimal(r["amount"])):
+            raise U.UtilitiesError(f"CSV line {r['line']} differs from {mpath}; use a new --out-dir for a new CSV")
+
+    def save():
+        mpath.write_text(json.dumps([manifest[k] for k in sorted(manifest)], indent=2) + "\n")
+
+    state = {r["line"]: _bundle_state((manifest.get(r["line"]) or {}).get("bundle")) for r in rows}
+    todo = [r for r in rows if state[r["line"]] is None]
+    print(f"{sum(v == 'executed' for v in state.values())} executed, {sum(v == 'prepared' for v in state.values())} prepared, "
+          f"{len(todo)} to prepare", file=sys.stderr)
+    if todo:
+        pending_aux = [x for x in sorted(outdir.glob("00-*.json")) if _bundle_state(str(x)) == "prepared"]
+        if pending_aux:
+            raise U.UtilitiesError(f"{pending_aux[0]} is prepared but not executed: execute it (cdz tx execute) or delete it, then rerun")
+        reserved = {manifest[r["line"]]["input"] for r in rows if state[r["line"]] == "prepared"}
+        mine = [h for h in _holdings(lc, p.party_id) if h["owner"] == p.party_id and h["admin"] == p.party_id
+                and h["instrument"] == args.instrument and not h["locked"] and h["contract_id"] not in reserved]
+        assignment = assign_exact_holdings(todo, mine)
+        if assignment is None:
+            if getattr(args, "_after_split", False):
+                raise U.UtilitiesError("exact-amount holdings are not visible yet after the split; rerun in a moment")
+            total = sum(Decimal(r["amount"]) for r in todo)
+            big = sorted(mine, key=lambda h: Decimal(h["amount"]), reverse=True)
+            n = len(list(outdir.glob("00-*.json"))) + 1
+            if not big or Decimal(big[0]["amount"]) < total:
+                have = sum(Decimal(h["amount"]) for h in mine)
+                if have < total:
+                    raise U.UtilitiesError(f"registrar holds {have} free unlocked {args.instrument}, the remaining lines need {total}")
+                kind, cmd = "merge", U.holding_merge(big[0]["contract_id"], [h["contract_id"] for h in big[1:]])
+                desc = f"Merge {len(big)} holdings of {args.instrument} (CSV needs {total})"
+            else:
+                kind, cmd = "split", U.holding_split(big[0]["contract_id"], [r["amount"] for r in todo])
+                desc = f"Split {big[0]['amount']} {args.instrument} into {len(todo)} exact amounts for the CSV"
+            aux = outdir / f"00-{kind}-{n}.json"
+            b = c.prepare_bundle(s, p, cmd, desc, lc=lc)
+            c.write_bundle(b, aux)
+            if not args.execute:
+                print(f"sign and execute {aux}, then rerun this command", file=sys.stderr)
+                return
+            args.output = str(aux)
             c.finish_prepared(args, s, b)
-            for _ in range(10):  # wait until the new holdings are visible, never split twice
+            for _ in range(10):  # wait until the new holdings are visible; never split twice per run
                 time.sleep(2)
                 mine = [h for h in _holdings(lc, p.party_id) if h["owner"] == p.party_id and h["admin"] == p.party_id
-                        and h["instrument"] == args.instrument and not h["locked"]]
-                if assign_exact_holdings(rows, mine) is not None or len(mine) == 1:
+                        and h["instrument"] == args.instrument and not h["locked"] and h["contract_id"] not in reserved]
+                if assign_exact_holdings(todo, mine) is not None or (kind == "merge" and len(mine) <= 1 + len(reserved)):
                     break
-            args._after_split = "split" in b.description.lower()
+            args._after_split = kind == "split"
             return cmd_transfers(args)
+        for r in todo:
+            out = outdir / f"{r['line']:04d}-{_safe(r['receiver'].split('::')[0])}.json"
+            _prepare_transfer(args, s, p, lc, r["receiver"], r["amount"], r["reason"], [assignment[r["line"]]], _duration(args.valid_for), out)
+            manifest[r["line"]] = {"line": r["line"], "receiver": r["receiver"], "amount": r["amount"], "reason": r["reason"],
+                                   "bundle": str(out), "input": assignment[r["line"]]}
+            save()
+    if not args.execute:
+        print(f"bundles in {outdir} (manifest.json); signers: `cdz bundle sign {outdir}/0[0-9]*-*.json`, "
+              f"then `cdz tx execute ...` (executed bundles are skipped)", file=sys.stderr)
         return
-    manifest = []
-    for r in rows:
-        out = outdir / f"{r['line']:04d}-{r['receiver'].split('::')[0][:24]}.json"
-        b = _prepare_transfer(args, s, p, lc, r["receiver"], r["amount"], r["reason"], [assignment[r["line"]]], _duration(args.valid_for), out)
-        manifest.append({"line": r["line"], "receiver": r["receiver"], "amount": r["amount"], "bundle": str(out), "input": assignment[r["line"]]})
-        if args.execute:
-            b.sign(s.protocol_keys())
-            r = c.execute_bundle(s, b, None)
-            b.meta["executed"] = {"update_id": r.get("updateId"), "offset": r.get("completionOffset")}
-            c.write_bundle(b, out)
-    (outdir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    print(f"prepared {len(manifest)} transfer bundles in {outdir} (manifest.json); sign them with `cdz bundle sign {outdir}/0*.json`", file=sys.stderr)
+    pending = [r for r in rows if _bundle_state(manifest[r["line"]]["bundle"]) == "prepared"]
+    if not pending:
+        print("nothing left to execute", file=sys.stderr)
+        return
+    total = sum(Decimal(r["amount"]) for r in pending)
+    for r in pending:
+        print(f"  line {r['line']}: {r['amount']} -> {r['receiver']}", file=sys.stderr)
+    c.confirm(args, f"Sign with local keys and execute {len(pending)} transfer(s), {total} {args.instrument} in total?")
+    keys = s.protocol_keys()
+    for r in pending:
+        path = manifest[r["line"]]["bundle"]
+        b = bundle.load(path)
+        b.sign(keys)
+        c.write_bundle(b, path)
+        res = c.execute_bundle(s, b, None)
+        b.meta["executed"] = {"update_id": res.get("updateId"), "offset": res.get("completionOffset")}
+        c.write_bundle(b, path)
+        manifest[r["line"]]["executed"] = b.meta["executed"]
+        save()
 
 
 def cmd_split(args):

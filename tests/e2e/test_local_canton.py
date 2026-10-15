@@ -118,6 +118,10 @@ def test_03_tampered_bundle_is_refused(world):
 
 def test_04_signing_threshold_and_hosting_changes(world):
     d = world["dir"]
+    # a node operator refuses to approve a proposal that changes another host (checked before signing)
+    r = cdz(d, "coord.env", "topology", "approve", "--hash", "12" * 34, "--admin-addr", ADMIN[3],
+            "--participant", world["parts"]["participant3"], "--yes", ok=False)
+    assert r.returncode != 0 and "no pending" in r.stderr
     cdz(d, "coord.env", "topology", "plan-party", "--signing-threshold", "3", "-o", "thr.json")
     for who in ["own0", "own2"]:
         cdz(d, f"{who}.env", "bundle", "sign", "thr.json", "--yes")
@@ -138,7 +142,7 @@ def test_04_signing_threshold_and_hosting_changes(world):
     cdz(d, "coord.env", "topology", "submit", "host.json", "--proposal", "--yes")
     h = json.loads((d / "host.json").read_text())["transactions"][0]["hash"]
     time.sleep(2)
-    cdz(d, "coord.env", "topology", "approve", "--hash", h, "--admin-addr", ADMIN[3], "--yes")
+    cdz(d, "coord.env", "topology", "approve", "--hash", h, "--admin-addr", ADMIN[3], "--participant", p3, "--yes")
     for _ in range(30):
         st = json.loads(cdz(d, "coord.env", "party", "status").stdout)
         if len(st["party_to_participant"]["hosts"]) == 3:
@@ -184,13 +188,17 @@ def test_06_admin_api_onboarding_path(world):
     p2p_hash = json.loads((d / "adm.json").read_text())["transactions"][-1]["hash"]
     time.sleep(2)
     for n in (2, 3):
-        cdz(d, "coord.env", "topology", "approve", "--hash", p2p_hash, "--admin-addr", ADMIN[n], "--yes")
+        cdz(d, "coord.env", "--party", "party-adm.json", "topology", "approve", "--hash", p2p_hash, "--admin-addr", ADMIN[n],
+            "--participant", parts[f"participant{n}"], "--yes")
     for _ in range(30):
         st = json.loads(cdz(d, "coord.env", "--party", "party-adm.json", "party", "status").stdout)
         if st["party_to_participant"]:
             break
         time.sleep(1)
     assert len(st["party_to_participant"]["hosts"]) == 2
+    r = cdz(d, "coord.env", "--party", "party-adm.json", "party", "grant-user", "--user", "cdz-adm-" + uuid.uuid4().hex[:4],
+            "--create", "--ledger-url", LEDGER[2])
+    assert json.loads(r.stdout)["created"] is True
     # transact through one of its hosts
     env2 = d / "coord2.env"
     env2.write_text((d / "coord.env").read_text().replace(LEDGER[1], LEDGER[2]))

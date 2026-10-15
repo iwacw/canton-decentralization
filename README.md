@@ -150,7 +150,8 @@ Roles in this runbook:
    cdz bundle show onboard.signed.json                     # "fully signed"
    ```
    Onboarding needs **all** owners (DNS creation) and **all** signing keys (proof of
-   possession). Use `--multi` for one signature per key over the combined hash.
+   possession). Use `--multi` for one signature per key over the combined hash. Signatures
+   that do not verify are dropped on merge and never sent.
 
 4. **Allocate on every host.** Each CPN operator runs this with an admin token for their own
    node:
@@ -164,8 +165,11 @@ Roles in this runbook:
    *Admin API alternative:*
    ```bash
    cdz topology submit onboard.signed.json --proposal   # NSDs + DNS complete, P2P pending
-   cdz topology approve --hash <p2p hash> --admin-addr <each host>
+   cdz topology approve --hash <p2p hash> --admin-addr <each host> --participant <its uid>
    ```
+   Before the node signs, `approve` fetches and decodes the proposal. For a new party, the
+   proposal must equal the `PartyToParticipant` in `party.json`. For an existing party, it may
+   only add or change that node.
 
 5. **App user.** Once the party is active, each CPN operator grants the coordinator's ledger
    user read and execute rights on their node:
@@ -200,6 +204,9 @@ Roles in this runbook:
    ```
    This first emits a `Holding_Split` bundle into exact amounts. Sign and execute it, then
    rerun the command. You get one transfer bundle per CSV row, each with its own input holding.
+   The run is resumable. `payouts/manifest.json` and each bundle's `executed` mark ensure that
+   a line is never prepared or executed twice, and a changed CSV is refused for the same
+   `--out-dir`.
    ```bash
    cdz bundle sign payouts/0*.json        # every signer, once, offline
    cdz tx execute payouts/0*.json         # coordinator, in order
@@ -268,7 +275,7 @@ cdz topology plan-dns --add-owner dave-ns.pub.json --remove-owner 1220…alice -
 
 cdz bundle sign keys.json -o keys.alice.json          # each holder
 cdz bundle merge keys.signed.json keys.*.json
-cdz bundle show keys.signed.json                      # lists what is still missing
+cdz bundle show keys.signed.json --live               # what is still missing; --live: base state vs node
 cdz topology submit keys.signed.json                  # --proposal when a participant must still approve
 ```
 
@@ -280,7 +287,11 @@ The tool refuses to build invalid mappings:
 - a DNS threshold above the number of owners
 
 Serials come from the head state. A concurrent change makes Canton reject the bundle; plan it
-again.
+again. The `CHANGE` line in every review is recomputed from the bytes (base state vs new
+mapping), not taken from the file.
+
+`cdz party status` warns about any key delegated directly in the party's namespace. Such a key
+could act without the owner threshold.
 
 ### Adding a host to an active party
 
@@ -312,12 +323,17 @@ Before anything is signed, a bundle is checked for the following:
 1. The hash recomputed from the transaction (V2 or V3; V4 is refused) equals the node's.
 2. `act_as` is exactly `[party]`.
 3. There is a single root node.
-4. The root node matches the command that was asked for (template/interface, choice, contract
-   id).
-5. The synchronizer is the expected one.
-6. The preparation time is not ahead of the local clock.
+4. The root node matches the command that was asked for: template or interface, package
+   (name or id), choice, contract id, and every argument the command states.
+5. Party id, network and signing keys/threshold equal the local `party.json`.
+6. The synchronizer equals `CDZ_SYNCHRONIZER_ID`.
+7. The preparation time is not ahead of the local clock.
 
-Signatures are verified against the party's registered keys before execution.
+Signers therefore need `party.json` and `CDZ_SYNCHRONIZER_ID` (both public) next to their key.
+Only `CDZ_TX_KEY_*` keys sign transactions.
+
+At execution, signatures are verified against the keys in `party.json`. `--ttl` (max record
+time) switches to hashing scheme V3, the first version whose signature covers it.
 
 Canton limits for external parties, quoted from the docs and the 3.5 protos:
 

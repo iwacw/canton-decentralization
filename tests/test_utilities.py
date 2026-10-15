@@ -129,14 +129,15 @@ def fake_prepared(party: str, command: dict) -> isp.PreparedTransaction:
     ((kind, body),) = command.items()
     tx = isp.DamlTransaction(version="2.1", roots=["0"])
     if kind == "CreateCommand":
-        node = nd.Node(create=nd.Create(lf_version="2.1", contract_id="00" + "11" * 32, package_name="p",
+        node = nd.Node(create=nd.Create(lf_version="2.1", contract_id="00" + "11" * 32, package_name=body["templateId"][1:].split(":")[0],
                                         template_id=_ident(body["templateId"]), argument=json_to_value(body["createArguments"]),
                                         signatories=[party], stakeholders=[party]))
     else:
-        e = nd.Exercise(lf_version="2.1", contract_id=body["contractId"], package_name="p", choice_id=body["choice"],
+        e = nd.Exercise(lf_version="2.1", contract_id=body["contractId"], package_name=body["templateId"][1:].split(":")[0], choice_id=body["choice"],
                         chosen_value=json_to_value(body["choiceArgument"]), consuming=True, acting_parties=[party],
                         signatories=[party], stakeholders=[party])
         if "Splice.Api" in body["templateId"]:
+            e.package_name = "utility-registry-app-v0"  # the implementing template's package
             e.interface_id.CopyFrom(_ident(body["templateId"]))
             e.template_id.CopyFrom(_ident("#utility-registry-app-v0:Utility.Registry.App.V0.Service.AllocationFactory:AllocationFactory"))
         else:
@@ -200,7 +201,7 @@ def env(tmp_path, monkeypatch):
     spec = PartySpec("reg", [Member("o", owners[0].public)], 1, [Member(k.name, k.public) for k in keys], 2,
                      [("p1::1220" + "aa" * 32, "confirmation")], 1, network="devnet")
     (tmp_path / "party.json").write_text(json.dumps(spec.to_json()))
-    (tmp_path / ".env").write_text("CDZ_NETWORK=devnet\nCDZ_LEDGER_URL=http://fake\n"
+    (tmp_path / ".env").write_text(f"CDZ_NETWORK=devnet\nCDZ_LEDGER_URL=http://fake\nCDZ_SYNCHRONIZER_ID={SYNC}\n"
                                    + "".join(f"CDZ_TX_KEY_{k.name.upper()}={k.pkcs8_b64()}\n" for k in keys[:2]))
     (tmp_path / ".env").chmod(0o600)
     monkeypatch.chdir(tmp_path)
@@ -240,26 +241,35 @@ def test_cli_csv_transfers_split_then_bundles(env, monkeypatch, tmp_path):
     (tmp_path / "pay.csv").write_text(f"receiver,amount,reason\n{ALICE},10,a\n{BOB},2.5,b\n")
     lc, reg = _wire(monkeypatch, [_holding("big", "100", party)])
     assert cli.main(["registrar", "transfers", "--csv", "pay.csv", "--instrument", "TOK", "--out-dir", "out"]) == 0
-    split = json.loads((tmp_path / "out/00-split.json").read_text())
+    split = json.loads((tmp_path / "out/00-split-1.json").read_text())
     assert split["intent"]["ExerciseCommand"]["choice"] == "Holding_Split"
     assert split["intent"]["ExerciseCommand"]["choiceArgument"]["amounts"] == ["10", "2.5"]
-    # after the split: exact holdings exist -> one bundle per row, each with its own input
-    lc.acs = [_holding("h10", "10", party), _holding("h25", "2.5", party), _holding("rest", "87.5", party)]
+    # rerunning before the split is executed is refused (no second split)
+    assert cli.main(["registrar", "transfers", "--csv", "pay.csv", "--instrument", "TOK", "--out-dir", "out"]) == 2
+    assert cli.main(["bundle", "sign", "--yes", "out/00-split-1.json"]) == 0
+    assert cli.main(["tx", "execute", "--yes", "out/00-split-1.json"]) == 0  # fake node applies the split
     assert cli.main(["registrar", "transfers", "--csv", "pay.csv", "--instrument", "TOK", "--out-dir", "out"]) == 0
     manifest = json.loads((tmp_path / "out/manifest.json").read_text())
-    assert [m["input"] for m in manifest] == [_cid("h10"), _cid("h25")]
+    assert [m["input"] for m in manifest] == [_cid("split0"), _cid("split1")]
     b = json.loads((tmp_path / manifest[0]["bundle"]).read_text())
     t = b["intent"]["ExerciseCommand"]
     assert t["choice"] == "TransferFactory_Transfer" and t["contractId"] == _cid("factory")
-    assert t["choiceArgument"]["transfer"]["inputHoldingCids"] == [_cid("h10")]
+    assert t["choiceArgument"]["transfer"]["inputHoldingCids"] == [_cid("split0")]
     assert t["choiceArgument"]["extraArgs"]["context"]["values"][U.CTX_INSTRUMENT_CONFIG]["value"] == "cfg"
     assert lc.prepared[-1][1][0]["contractId"] == "cfg"  # disclosed contracts passed through
-    # offline batch signing of all bundles, then execution in order
+    # offline batch signing, execute only the first line
     assert cli.main(["bundle", "sign", "--yes", *[m["bundle"] for m in manifest]]) == 0
-    assert cli.main(["tx", "execute", "--yes", *[m["bundle"] for m in manifest]]) == 0
-    assert len(lc.executed) == 2
+    assert cli.main(["tx", "execute", "--yes", manifest[0]["bundle"]]) == 0
+    assert len(lc.executed) == 2  # split + line 2
+    # a rerun neither re-prepares nor re-executes line 2; --execute finishes line 3 only
+    n_prepared = len(lc.prepared)
+    assert cli.main(["registrar", "transfers", "--csv", "pay.csv", "--instrument", "TOK", "--out-dir", "out", "--execute", "--yes"]) == 0
+    assert len(lc.prepared) == n_prepared and len(lc.executed) == 3
     assert cli.main(["tx", "execute", "--yes", manifest[0]["bundle"]]) == 0  # already executed: skipped
-    assert len(lc.executed) == 2
+    assert len(lc.executed) == 3
+    # a changed CSV under the same out-dir is refused
+    (tmp_path / "pay.csv").write_text(f"receiver,amount\n{ALICE},11\n")
+    assert cli.main(["registrar", "transfers", "--csv", "pay.csv", "--instrument", "TOK", "--out-dir", "out"]) == 2
 
 
 def test_cli_refuses_wrong_network(env, monkeypatch):
@@ -294,3 +304,21 @@ def test_cli_csv_transfers_execute_end_to_end(env, monkeypatch, tmp_path):
     chosen = [json.loads((tmp_path / m["bundle"]).read_text())["meta"]["executed"] for m in json.loads((tmp_path / "out/manifest.json").read_text())]
     assert len(lc.executed) == 3 and len(chosen) == 2  # split + two transfers
     assert [c for c, _ in reg.calls] == ["factory", "factory"]
+
+
+def test_intent_package_pinning():
+    from cdz import prepared
+
+    cmd = U.registrar_service_request(OP, BOB, REG)
+    p = fake_prepared(REG, cmd)
+    p.transaction.nodes[0].v1.create.package_name = "evil-registry-app-v0"
+    with pytest.raises(prepared.PreparedCheckError, match="package"):
+        prepared.check(p, tx_hash.V2, None, REG, cmd)
+    t = U.transfer(_cid("f"), U.transfer_args(REG, REG, ALICE, "1", "TOK", "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z", [_cid("h")]))
+    p = fake_prepared(REG, t)
+    prepared.check(p, tx_hash.V2, None, REG, t, expect_template_package="utility-registry-app-v0")
+    p.transaction.nodes[0].v1.exercise.package_name = "other"
+    with pytest.raises(prepared.PreparedCheckError, match="expected utility-registry-app-v0"):
+        prepared.check(p, tx_hash.V2, None, REG, t, expect_template_package="utility-registry-app-v0")
+    assert prepared.compare_value({"a": "1"}, vp.Value(record=vp.Record(fields=[vp.RecordField(value=vp.Value(text="1"))])))
+    assert prepared.value_to_py(vp.Value(numeric="1000000.0000000000")) == "1000000"
