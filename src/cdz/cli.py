@@ -395,8 +395,9 @@ def cmd_topology_submit(args):
     if not complete and not args.proposal:
         raise CliError("not fully authorized yet (participants and/or signers missing); pass --proposal to submit as proposal")
     confirm(args, f"Submit {len(b.items)} topology transaction(s) to {sync}?")
-    a.add_transactions(sync, b.signed_transactions(proposal=not complete), force=args.force or [])
-    out({"submitted": [it.tx.hash.hex() for it in b.items], "proposal": not complete})
+    flags = [not rep.satisfied for _, rep, _ in b.check(p.known_keys() if p else None, assume_participants=False)]
+    a.add_transactions(sync, b.signed_transactions(proposal=flags), force=args.force or [])
+    out({"submitted": [{"label": it.label, "hash": it.tx.hash.hex(), "proposal": f} for it, f in zip(b.items, flags, strict=True)]})
 
 
 def cmd_topology_approve(args):

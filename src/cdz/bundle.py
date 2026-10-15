@@ -117,8 +117,10 @@ class TopologyBundle:
                 added += len(s)
         return added
 
-    def signed_transactions(self, proposal: bool = False):
-        return [topology.signed_tx(it.tx, it.sigs, proposal, self.multi_for(it.tx)) for it in self.items]
+    def signed_transactions(self, proposal=False):
+        """`proposal`: one flag for all items, or a list with one flag per item."""
+        flags = proposal if isinstance(proposal, list) else [proposal] * len(self.items)
+        return [topology.signed_tx(it.tx, it.sigs, f, self.multi_for(it.tx)) for it, f in zip(self.items, flags, strict=True)]
 
     # --- json -----------------------------------------------------------------------------
 
