@@ -163,3 +163,76 @@ def test_05_dns_owner_rotation(world):
         time.sleep(1)
     own3 = json.loads((d / "own3.pub.json").read_text())["fingerprint"]
     assert own3 in st["dns"]["owners"] and own0 not in st["dns"]["owners"]
+
+
+def test_06_admin_api_onboarding_path(world):
+    """Alternative to AllocateExternalParty: AddTransactions (P2P as proposal) + each host approves."""
+    d = world["dir"]
+    parts = world["parts"]
+    hint = "adm-" + uuid.uuid4().hex[:6]
+    r = cdz(
+        d, "coord.env", "--party", "party-adm.json", "party", "new", "--hint", hint, "-o", "party-adm.json",
+        "--owner", "own1.pub.json", "--owner", "own2.pub.json", "--owners-threshold", "1",
+        "--signing-key", "tx1.pub.json", "--signing-threshold", "1",
+        "--host", parts["participant2"], "--host", parts["participant3"], "--confirmation-threshold", "1",
+    )
+    party = json.loads(r.stdout)["party_id"]
+    cdz(d, "coord.env", "--party", "party-adm.json", "party", "onboard-bundle", "-o", "adm.json")
+    for who in ["own1", "own2", "tx1"]:
+        cdz(d, f"{who}.env", "--party", "party-adm.json", "bundle", "sign", "adm.json", "--multi", "--yes")
+    cdz(d, "coord.env", "--party", "party-adm.json", "topology", "submit", "adm.json", "--proposal", "--yes")
+    p2p_hash = json.loads((d / "adm.json").read_text())["transactions"][-1]["hash"]
+    time.sleep(2)
+    for n in (2, 3):
+        cdz(d, "coord.env", "topology", "approve", "--hash", p2p_hash, "--admin-addr", ADMIN[n], "--yes")
+    for _ in range(30):
+        st = json.loads(cdz(d, "coord.env", "--party", "party-adm.json", "party", "status").stdout)
+        if st["party_to_participant"]:
+            break
+        time.sleep(1)
+    assert len(st["party_to_participant"]["hosts"]) == 2
+    # transact through one of its hosts
+    env2 = d / "coord2.env"
+    env2.write_text((d / "coord.env").read_text().replace(LEDGER[1], LEDGER[2]))
+    args = json.dumps({"id": "adm", "initiator": party, "responder": party})
+    cdz(d, "coord2.env", "--party", "party-adm.json", "tx", "prepare", "--create", PING, "--args", args, "-o", "adm-tx.json")
+    cdz(d, "tx1.env", "--party", "party-adm.json", "bundle", "sign", "adm-tx.json", "--yes")
+    r = cdz(d, "coord2.env", "--party", "party-adm.json", "tx", "execute", "adm-tx.json", "--yes")
+    assert json.loads(r.stdout)["executed"]
+
+
+def _post(url, body):
+    r = subprocess.run(["curl", "-sf", "-X", "POST", "-H", "Content-Type: application/json", "-d", json.dumps(body), url],
+                       capture_output=True, text=True)
+    return json.loads(r.stdout)
+
+
+def test_07_exercise_on_disclosed_contract(world):
+    """Exercise node + input contract in the hash: a local party creates a Ping, the external party responds."""
+    d = world["dir"]
+    alice = _post(LEDGER[1] + "/v2/parties", {"partyIdHint": "bob-" + uuid.uuid4().hex[:6]})["partyDetails"]["party"]
+    _post(LEDGER[1] + "/v2/users/cdz-e2e/rights",
+          {"userId": "cdz-e2e", "rights": [{"kind": {"CanActAs": {"value": {"party": alice}}}}]})
+    pid = "disc-" + uuid.uuid4().hex[:6]
+    _post(LEDGER[1] + "/v2/commands/submit-and-wait", {
+        "commands": [{"CreateCommand": {"templateId": PING, "createArguments": {"id": pid, "initiator": alice, "responder": world["party"]}}}],
+        "commandId": str(uuid.uuid4()), "actAs": [alice], "userId": "cdz-e2e"})
+    end = int(_post(LEDGER[1] + "/v2/state/active-contracts-page", {
+        "eventFormat": {"filtersByParty": {alice: {"cumulative": [{"identifierFilter": {"TemplateFilter": {"value": {"templateId": PING, "includeCreatedEventBlob": True}}}}]}}}
+    })["activeAtOffset"])
+    page = _post(LEDGER[1] + "/v2/state/active-contracts-page", {"activeAtOffset": end, "eventFormat": {"filtersByParty": {alice: {"cumulative": [
+        {"identifierFilter": {"TemplateFilter": {"value": {"templateId": PING, "includeCreatedEventBlob": True}}}}]}}}})
+    ev = [e["contractEntry"]["JsActiveContract"]["createdEvent"] for e in page["activeContracts"]
+          if e["contractEntry"]["JsActiveContract"]["createdEvent"]["createArgument"]["id"] == pid][0]
+    (d / "disc.json").write_text(json.dumps([{"templateId": ev["templateId"], "contractId": ev["contractId"],
+                                              "createdEventBlob": ev["createdEventBlob"], "synchronizerId": world["sync"]}]))
+    for scheme in ("v2", "v3"):
+        r = cdz(d, "coord.env", "tx", "prepare", "--exercise", PING, "--cid", ev["contractId"], "--choice", "Respond",
+                "--args", "{}", "--disclosed", "disc.json", "--scheme", scheme, "-o", f"resp-{scheme}.json")
+        assert "hash verified locally" in r.stderr
+        b = json.loads((d / f"resp-{scheme}.json").read_text())
+        assert b["summary"]["input_contracts"] == 1 and b["summary"]["roots"][0]["exercise"] == "Respond"
+    for who in ["tx0", "tx1", "tx2"]:
+        cdz(d, f"{who}.env", "bundle", "sign", "resp-v3.json", "--yes")
+    r = cdz(d, "coord.env", "tx", "execute", "resp-v3.json", "--yes")
+    assert json.loads(r.stdout)["executed"]
