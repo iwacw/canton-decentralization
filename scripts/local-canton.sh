@@ -16,12 +16,18 @@ case "${1:-}" in
     fi
     mkdir -p "$RUN"; rm -f "$RUN"/{ready,synchronizer_id,participants,canton_ports.json}
     cp "$ROOT/tests/e2e/canton/"* "$RUN/"
-    (cd "$RUN" && JAVA_OPTS="${JAVA_OPTS:--Xms512m -Xmx2g -XX:+UseSerialGC}" nohup "$DIST/bin/canton" daemon \
-        -c e2e.conf --bootstrap bootstrap.canton --log-file-name canton.log > canton.out 2>&1 & echo $! > canton.pid)
+    cd "$RUN"
+    JAVA_OPTS="${JAVA_OPTS:--Xms512m -Xmx2g -XX:+UseSerialGC}" nohup "$DIST/bin/canton" daemon \
+      -c e2e.conf --bootstrap bootstrap.canton --log-file-name canton.log > canton.out 2>&1 < /dev/null &
+    echo $! > canton.pid
     for _ in $(seq 1 60); do [[ -f "$RUN/ready" ]] && { echo "canton ready ($RUN)"; exit 0; }; sleep 3; done
     echo "canton did not start, see $RUN/canton.log" >&2; exit 1 ;;
   stop)
-    [[ -f "$RUN/canton.pid" ]] && pkill -P "$(cat "$RUN/canton.pid")" 2>/dev/null; kill "$(cat "$RUN/canton.pid")" 2>/dev/null || true
+    if [[ -f "$RUN/canton.pid" ]]; then
+      pid="$(cat "$RUN/canton.pid")"
+      pkill -P "$pid" 2>/dev/null || true
+      kill "$pid" 2>/dev/null || true
+    fi
     rm -f "$RUN/canton.pid" "$RUN/ready"; echo stopped ;;
   status)
     [[ -f "$RUN/ready" ]] && echo "running: $(cat "$RUN/synchronizer_id")" || echo "not running" ;;
