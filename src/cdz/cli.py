@@ -8,6 +8,7 @@ import datetime as dt
 import functools
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -33,7 +34,9 @@ def confirm(args, question: str) -> None:
         return
     if not sys.stdin.isatty():
         raise CliError(f"{question} (refusing without a TTY; pass --yes)")
-    if input(f"{question} [y/N] ").strip().lower() not in ("y", "yes"):
+    sys.stderr.write(f"{question} [y/N] ")
+    sys.stderr.flush()
+    if sys.stdin.readline().strip().lower() not in ("y", "yes"):
         raise CliError("aborted")
 
 
@@ -138,6 +141,8 @@ def print_topology_bundle(b: bundle.TopologyBundle, party: PartySpec | None = No
 
 
 def cmd_keys_generate(args):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", args.name):
+        raise CliError("key name: letters, digits, '-' and '_' only")
     k = crypto.SigningKey.generate(args.spec, args.name)
     prefix = "CDZ_NS_KEY_" if args.role == "ns" else "CDZ_TX_KEY_"
     var = f"{prefix}{args.name.upper().replace('-', '_')}"
@@ -152,9 +157,11 @@ def cmd_keys_generate(args):
             f.write(line)
         os.chmod(p, 0o600)
         print(f"appended {var} to {p}", file=sys.stderr)
-    else:
+    elif args.print_private:
         print("# private key, keep secret:", file=sys.stderr)
         print(line, end="", file=sys.stderr)
+    else:
+        raise CliError("pass --env-out FILE (or --print-private to show the private key on the terminal)")
     pub = {"name": args.name, "role": args.role, **k.public.to_json()}
     if args.pub_out:
         Path(args.pub_out).write_text(json.dumps(pub, indent=2) + "\n")
@@ -628,6 +635,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--spec", choices=list(crypto.SPECS), default="ed25519")
     p.add_argument("--name", required=True)
     p.add_argument("--env-out", help="append CDZ_*_KEY_<NAME>=... to this file (0600)")
+    p.add_argument("--print-private", action="store_true", help="print the private key to stderr instead")
     p.add_argument("--pub-out", help="write the public key JSON here")
     add(keys, "list", cmd_keys_list, "list local keys (fingerprints only)")
     p = add(keys, "public", cmd_keys_public, "print a local key's public JSON for the coordinator")
