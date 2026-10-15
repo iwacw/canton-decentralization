@@ -1,0 +1,3 @@
+# Local open-source Canton started by scripts/local-canton.sh (tests only; no DA Utilities).
+name = "local"
+synchronizer_id = ""   # discovered from the participant

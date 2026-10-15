@@ -1,0 +1,6 @@
+nodes.local.start()
+val synchronizerId = bootstrap.synchronizer_local()
+participants.local.foreach(_.synchronizers.connect_local(sequencer1, alias = "da"))
+better.files.File("synchronizer_id").write(synchronizerId.logical.toProtoPrimitive)
+better.files.File("participants").write(participants.local.map(_.uid.toProtoPrimitive).mkString("\n"))
+better.files.File("ready").write("ok")

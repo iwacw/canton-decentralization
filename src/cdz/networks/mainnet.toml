@@ -1,0 +1,9 @@
+# Canton Network MainNet. Values from docs.digitalasset.com/registry (fetched 2026-09).
+name = "mainnet"
+synchronizer_id = ""   # pin with CDZ_SYNCHRONIZER_ID (see devnet.toml)
+
+[utilities]
+api = "https://api.utilities.digitalasset.com"
+# Re-check with GET {api}/api/utilities/v0/operator before first use.
+operator_party = "auth0_007c6643538f2eadd3e573dd05b9::12205bcc106efa0eaa7f18dc491e5c6f5fb9b0cc68dc110ae66f4ed6467475d7c78e"
+registry_ui = "https://registry.app.digitalasset.com/"

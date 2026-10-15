@@ -1,0 +1,11 @@
+# Canton Network DevNet. Values from docs.digitalasset.com/registry (fetched 2026-09).
+name = "devnet"
+# Global synchronizer id changes on hard migrations: pin it with CDZ_SYNCHRONIZER_ID after checking
+# `cdz status` (the participant's connected synchronizers). Empty = discover (must be exactly one).
+synchronizer_id = ""
+
+[utilities]
+api = "https://api.utilities.digitalasset-dev.com"
+# DA operator party is not published for DevNet; empty = GET {api}/api/utilities/v0/operator
+operator_party = ""
+registry_ui = "https://registry.dev.app.digitalasset.com/"

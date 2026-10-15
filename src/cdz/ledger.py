@@ -167,6 +167,17 @@ class LedgerClient:
     def party_details(self, party: str) -> list[dict]:
         return self._req("GET", f"/v2/parties/{urllib.parse.quote(party, safe='')}").get("partyDetails", [])
 
+    def ensure_user(self, user: str) -> bool:
+        """Create the ledger user if missing (needs participant/IDP admin). True if created."""
+        try:
+            self._req("GET", f"/v2/users/{urllib.parse.quote(user, safe='')}")
+            return False
+        except LedgerError as e:
+            if e.status != 404:
+                raise
+        self._req("POST", "/v2/users", {"user": {"id": user, "isDeactivated": False, "identityProviderId": ""}, "rights": []})
+        return True
+
     def grant_rights(self, user: str, act_as=(), read_as=(), execute_as=()) -> dict:
         rights = (
             [{"kind": {"CanActAs": {"value": {"party": p}}}} for p in act_as]

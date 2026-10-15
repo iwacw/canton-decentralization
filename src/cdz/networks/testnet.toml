@@ -1,0 +1,8 @@
+# Canton Network TestNet. Values from docs.digitalasset.com (fetched 2026-09).
+name = "testnet"
+synchronizer_id = ""
+
+[utilities]
+api = "https://api.utilities.digitalasset-staging.com"
+operator_party = "DigitalAsset-UtilityOperator::12202679f2bbe57d8cba9ef3cee847ac8239df0877105ab1f01a77d47477fdce1204"
+registry_ui = "https://registry.test.app.digitalasset.com/"
