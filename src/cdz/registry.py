@@ -99,6 +99,17 @@ class RegistryClient:
         ctx, disclosed = self._ctx(r)
         return r["factoryId"], ctx, disclosed
 
+    def mint_request_factory(self, holder: str, admin: str, instrument: str) -> tuple[str, dict, list[dict]]:
+        r = self._req("POST", "/api/utilities/v0/registry/mint/v0/request",
+                      {"holder": holder, "instrumentId": {"admin": admin, "id": instrument}})
+        ctx, disclosed = self._ctx(r)
+        return r["factoryId"], ctx, disclosed
+
+    def mint_offer_accept_context(self, cid: str) -> tuple[dict, list[dict]]:
+        r = self._req("POST", f"/api/utilities/v0/registry/mint/v0/offer/{cid}/choice-contexts/accept",
+                      {"meta": {}, "excludeDebugFields": True})
+        return self._ctx(r)
+
     def burn_request_accept_context(self, cid: str) -> tuple[dict, list[dict]]:
         r = self._req("POST", f"/api/utilities/v0/registry/burn/v0/request/{cid}/choice-contexts/accept",
                       {"meta": {}, "excludeDebugFields": True})

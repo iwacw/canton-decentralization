@@ -98,6 +98,21 @@ class AdminClient:
         )
         return list(r.results)
 
+    def signing_windows(self, sync: str) -> dict:
+        """Synchronizer tolerances that bound how long a prepared transaction stays signable."""
+        r = self._call(
+            self.read.ListSynchronizerParametersState,
+            rd.ListSynchronizerParametersStateRequest(base_query=self._q(sync)),
+        )
+        if not r.results:
+            return {}
+        p = item(r.results[-1])
+        return {
+            "preparation_time_record_time_tolerance_s": p.preparation_time_record_time_tolerance.seconds,
+            "ledger_time_record_time_tolerance_s": p.ledger_time_record_time_tolerance.seconds,
+            "mediator_deduplication_timeout_s": p.mediator_deduplication_timeout.seconds,
+        }
+
     def state(self, sync: str, namespaces: list[str] = (), parties: list[str] = ()) -> authz.State:
         """Head state for the given namespaces (incl. DNS owners) and parties."""
         st = authz.State()

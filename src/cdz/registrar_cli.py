@@ -210,6 +210,22 @@ def cmd_mint_offer(args):
          meta={"executeBefore": exp})
 
 
+def cmd_mint_request(args):
+    """Treasury mint: the registrar requests a mint to itself (then mint-accept)."""
+    c, s, p = _ctx(args)
+    req_at, exp = U.window(_duration(args.valid_for))
+    mint = U.mint_record(p.party_id, args.instrument, args.amount, p.party_id, args.reference or "", req_at, exp)
+    factory, ctx, disclosed = _registry(s).mint_request_factory(p.party_id, p.party_id, args.instrument)
+    _run(args, s, p, U.request_mint(factory, p.party_id, mint, ctx), f"Request mint of {mint['amount']} {args.instrument} to the registrar",
+         disclosed, meta={"executeBefore": exp})
+
+
+def cmd_mint_offer_accept(args):
+    c, s, p = _ctx(args)
+    ctx, disclosed = _registry(s).mint_offer_accept_context(args.offer)
+    _run(args, s, p, U.mint_offer_accept(args.offer, ctx), f"Accept mint offer {args.offer[:16]}… (registrar as holder)", disclosed)
+
+
 def cmd_burn_accept(args):
     c, s, p = _ctx(args)
     ctx, disclosed = _registry(s).burn_request_accept_context(args.request)
@@ -422,6 +438,13 @@ def register(sub, add, yes):
     p.add_argument("--valid-for", default="7d", help="executeBefore = now + this (e.g. 24h)")
     p.add_argument("--factory", help="AllocationFactory cid (local context)")
     mint_ctx(p)
+    p = common(add(reg, "mint-request", cmd_mint_request, "AllocationFactory_RequestMint to the registrar itself (treasury)"), "mint-request.bundle.json")
+    p.add_argument("--instrument", required=True)
+    p.add_argument("--amount", required=True)
+    p.add_argument("--reference")
+    p.add_argument("--valid-for", default="7d")
+    p = common(add(reg, "mint-offer-accept", cmd_mint_offer_accept, "MintOffer_Accept for an offer to the registrar"), "mint-offer-accept.bundle.json")
+    p.add_argument("--offer", required=True)
     p = common(add(reg, "burn-accept", cmd_burn_accept, "BurnRequest_Accept"), "burn-accept.bundle.json")
     p.add_argument("--request", required=True)
 

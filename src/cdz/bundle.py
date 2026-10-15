@@ -105,7 +105,7 @@ class TopologyBundle:
         if [it.tx.serialized for it in self.items] != [it.tx.serialized for it in other.items]:
             raise BundleError("bundles contain different transactions")
         added = 0
-        for a, b in zip(self.items, other.items):
+        for a, b in zip(self.items, other.items, strict=True):
             have = {(s.signed_by, s.signature) for s in a.sigs}
             for s in b.sigs:
                 if (s.signed_by, s.signature) not in have:

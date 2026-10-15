@@ -9,10 +9,9 @@ import functools
 import json
 import os
 import sys
-import time
 from pathlib import Path
 
-from cdz import __version__, authz, bundle, crypto, manage, prepared, topology
+from cdz import __version__, bundle, crypto, manage, prepared, topology
 from cdz.config import ConfigError, Settings
 from cdz.party import Member, PartySpec
 
@@ -215,19 +214,23 @@ def cmd_party_show(args):
 def cmd_party_onboard_bundle(args):
     s = settings(args)
     p = load_party(s)
-    skip = set()
+    skip, base = set(), []
     sync = s.synchronizer_id
     if args.check_existing:
         a = admin_client(s)
-        sync = sync or sync_id(s)
+        sync = sync or sync_id(s, ledger(s))
         for o in p.owner_namespaces:
-            if any(admin_item(r).namespace == o for r in a.namespace_delegations(sync, o)):
-                skip.add(o)
+            for r in a.namespace_delegations(sync, o):
+                n = admin_item(r)
+                if n.namespace == o and crypto.PublicKey.from_proto(n.target_key).fingerprint == o:
+                    skip.add(o)  # root certificate already on the synchronizer: reuse it
+                    base.append(topology.Tx.build(topology.tpb.TopologyMapping(namespace_delegation=n), max(r.context.serial, 1)))
     b = bundle.TopologyBundle(
         s.network["name"],
         sync,
         f"Onboard external party {p.party_id}",
         [bundle.Item(l, t) for l, t in p.onboarding_txs(skip)],
+        base=base,
         meta={"party_id": p.party_id, "operation": "onboard"},
     )
     write_bundle(b, args.output)
@@ -569,7 +572,8 @@ def cmd_tx_execute(args):
 
 def cmd_status(args):
     s = settings(args)
-    res = {"network": s.network["name"], "version": __version__}
+    res = {"network": s.network["name"], "version": __version__, "party_file": s.party_file}
+    lc = None
     if s.ledger_url:
         try:
             lc = ledger(s)
@@ -577,10 +581,12 @@ def cmd_status(args):
             res["synchronizers"] = lc.connected_synchronizers()
         except Exception as e:
             res["ledger_error"] = str(e)
+            lc = None
     if s.admin_addr:
         try:
-            a = admin_client(s)
-            res["admin"] = "reachable" if a.namespace_delegations(sync_id(s, ledger(s) if s.ledger_url else None), "") is not None else "?"
+            sync = s.synchronizer_id or (lc.synchronizer_id() if lc else None)
+            if sync:
+                res["signing_windows"] = admin_client(s).signing_windows(sync)
         except Exception as e:
             res["admin_error"] = str(e)
     res["local_keys"] = {"ns": [k.fingerprint for k in s.namespace_keys()], "tx": [k.fingerprint for k in s.protocol_keys()]}

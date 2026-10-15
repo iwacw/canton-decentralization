@@ -270,6 +270,24 @@ def offer_mint(factory_cid: str, registrar: str, mint: dict, context: dict):
     )
 
 
+def request_mint(factory_cid: str, registrar: str, mint: dict, context: dict):
+    """AllocationFactory_RequestMint (controller: mint.holder). Single-party only when the holder
+    is the registrar itself: treasury mint, then distribute with TransferFactory_Transfer."""
+    if mint["holder"] != registrar:
+        raise UtilitiesError("RequestMint is the holder's choice; the registrar can only request a mint to itself")
+    return _exercise(
+        T["allocation_factory"],
+        factory_cid,
+        "AllocationFactory_RequestMint",
+        {"expectedAdmin": registrar, "mint": mint, "extraArgs": extra_args(context)},
+    )
+
+
+def mint_offer_accept(cid: str, context: dict):
+    """MintOffer_Accept (controller: holder), for offers made to the registrar itself."""
+    return _exercise(T["mint_offer"], cid, "MintOffer_Accept", {"extraArgs": extra_args(context)})
+
+
 def mint_offer_cancel(cid: str):
     return _exercise(T["mint_offer"], cid, "MintOffer_Cancel", {"extraArgs": None})
 
