@@ -94,7 +94,7 @@ def test_env_file_parsing(tmp_path, monkeypatch):
         "# comment\n"
         "export CDZ_NETWORK=devnet   # inline comment\n"
         f"CDZ_TX_KEY_2='{k.pkcs8_b64()}'\n"
-        "CDZ_TX_KEY_10=\n"
+        "CDZ_TX_KEY_10=          # empty, comment only\n"
         f"CDZ_NS_KEY_A=file:{tmp_path / 'k.pem'}\n"
     )
     (tmp_path / "k.pem").write_text(
