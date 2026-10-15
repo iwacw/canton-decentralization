@@ -472,6 +472,9 @@ def show_submission(b: bundle.SubmissionBundle, file=None) -> None:
     summary = prepared.summarize(b.prepared)
     print(f"{b.description or 'transaction'} for {b.party}  [{b.network}]")
     print(f"scheme {prepared.SCHEME_NAMES[b.scheme]}; {verdict}")
+    shown = {k: v for k, v in b.meta.items() if k in ("executeBefore", "transferKind", "executed", "prepared_via")}
+    if shown:
+        print("meta: " + json.dumps(shown))
     print(json.dumps(summary, indent=2))
     valid = b.valid_signatures() if verdict.startswith("hash") else []
     names = ", ".join(s.signed_by[:12] + "…" for s in valid) or "none"
