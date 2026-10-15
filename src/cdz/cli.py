@@ -359,6 +359,11 @@ def cmd_bundle_sign(args):
             confirm(args, f"Sign with {', '.join(k.name for k in relevant)}?")
             done = b.sign(relevant, use_multi=args.multi)
         else:
+            p = _party_or_none(s)
+            if p and b.party != p.party_id:
+                raise CliError(f"{path}: bundle is for {b.party}, party.json is {p.party_id}")
+            if p and {k.fingerprint for k in b.signing_keys} != {m.key.fingerprint for m in p.signing_keys}:
+                print("warning: the bundle's signing keys differ from party.json (check `cdz party status`)", file=sys.stderr)
             show_submission(b)
             confirm(args, f"Sign this transaction for {b.party}?")
             done = b.sign(keys)

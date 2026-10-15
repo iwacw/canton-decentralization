@@ -448,6 +448,7 @@ backend, or a Splice validator.
 | topology changes | signing threshold, key rotation (incl. P-384), DNS owner add/remove + threshold, add host (proposal + approval), clear onboarding flag, confirmation threshold, remove host |
 | prepared-transaction hash V2/V3 | equals the node's hash for create and for exercise on a disclosed contract (input contracts); Canton's own golden vectors pass |
 | m-of-n execution | below-threshold signatures refused by the node; 2-of-3 and 3-of-3 (Ed25519/P-256/secp256k1/P-384) accepted, also via a non-hosting node |
+| pre-sign checks | a real prepared transaction whose arguments differ from the requested command is refused (`$.id: 'm' != 'different'`) |
 | offline multi-signer flow | separate `.env` per holder; sign copies, merge, submit (CLI e2e) |
 | Utilities commands | **unverified against DA.** Choice and field names match the Utility 0.14.4 models; context/API shapes follow DA's docs; CLI wiring tested with fakes |
 | Admin API TLS, OAuth2 tokens, ACS replication | not tested |
