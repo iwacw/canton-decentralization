@@ -47,6 +47,12 @@ def store_id(synchronizer_id: str | None) -> cmn.StoreId:
     return cmn.StoreId(synchronizer=cmn.Synchronizer(id=synchronizer_id))
 
 
+def item(res):
+    """List results carry the mapping as `item` or as the oneof `item { v30 }` (3.5)."""
+    which = res.WhichOneof("item") if "item" in res.DESCRIPTOR.oneofs_by_name else None
+    return getattr(res, which) if which else res.item
+
+
 class AdminClient:
     def __init__(self, target: str, tls: bool = False, ca_file: str | None = None, timeout: float = 30.0):
         if tls:
@@ -103,21 +109,21 @@ class AdminClient:
                 continue
             seen.add(ns)
             for res in self.decentralized_namespaces(sync, ns):
-                d = res.item
+                d = item(res)
                 if d.decentralized_namespace == ns:
                     st.dns[ns] = d
                     st.serials[("decentralized_namespace_definition", ns)] = res.context.serial
                     todo.extend(d.owners)
             for res in self.namespace_delegations(sync, ns):
-                n = res.item
+                n = item(res)
                 if n.namespace == ns:
                     fp = crypto.PublicKey.from_proto(n.target_key).fingerprint
                     st.nsds[(ns, fp)] = n
                     st.serials[("namespace_delegation", ns, fp)] = res.context.serial
         for party in parties:
             for res in self.party_to_participant(sync, party):
-                if res.item.party == party:
-                    st.p2p[party] = res.item
+                if item(res).party == party:
+                    st.p2p[party] = item(res)
                     st.serials[("party_to_participant", party)] = res.context.serial
         return st
 
@@ -134,6 +140,15 @@ class AdminClient:
         """Node operator side: sign a pending proposal (e.g. accept hosting the party) with node keys."""
         req = wr.AuthorizeRequest(transaction_hash=tx_hash_hex, must_fully_authorize=must_fully, store=store_id(sync))
         req.force_changes.extend(FORCE_FLAGS[f] for f in force)
+        return self._call(self.write.Authorize, req).transaction
+
+    def authorize_mapping(self, sync: str, mapping: tpb.TopologyMapping, serial: int, op: int, must_fully: bool = False):
+        """Node operator side: propose a mapping signed with this node's keys (e.g. clearing its own
+        onboarding flag, which only the participant may authorize)."""
+        req = wr.AuthorizeRequest(must_fully_authorize=must_fully, store=store_id(sync))
+        req.proposal.change = op
+        req.proposal.serial = serial
+        req.proposal.v30.CopyFrom(mapping)
         return self._call(self.write.Authorize, req).transaction
 
     def generate(self, sync: str, items: list[tuple[tpb.TopologyMapping, int, int]]) -> list[tuple[bytes, bytes]]:

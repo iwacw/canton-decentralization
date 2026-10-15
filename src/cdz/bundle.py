@@ -75,16 +75,19 @@ class TopologyBundle:
     # --- signing --------------------------------------------------------------------------
 
     def sign(self, keys: list[crypto.SigningKey], use_multi: bool = False) -> list[str]:
-        """Sign every item a key can contribute to. Returns 'label <- key' lines."""
+        """Sign every item a key can contribute to. With `use_multi`, each relevant key signs the
+        combined hash of ALL items once (what AllocateExternalParty's multiHashSignatures expects)."""
         done = []
+        all_hashes = [it.tx.hash for it in self.items]
         for k in keys:
             idx = self.relevant(k.fingerprint)
             if not idx:
                 continue
-            if use_multi and len(idx) > 1:
-                hashes = [self.items[i].tx.hash for i in idx]
-                self.multi.append((hashes, [k.signature(crypto.multi_tx_hash(hashes))]))
-                done.append(f"multi[{','.join(self.items[i].label for i in idx)}] <- {k.name or k.fingerprint[:12]}")
+            if use_multi:
+                if any(sorted(h) == sorted(all_hashes) and any(s.signed_by == k.fingerprint for s in ss) for h, ss in self.multi):
+                    continue
+                self.multi.append((all_hashes, [k.signature(crypto.multi_tx_hash(all_hashes))]))
+                done.append(f"multi[all {len(all_hashes)}] <- {k.name or k.fingerprint[:12]}")
                 continue
             for i in idx:
                 it = self.items[i]
@@ -93,6 +96,10 @@ class TopologyBundle:
                 it.sigs.append(k.signature(it.tx.hash))
                 done.append(f"{it.label} <- {k.name or k.fingerprint[:12]}")
         return done
+
+    def multi_over_all(self) -> list[crypto.Sig]:
+        all_hashes = sorted(it.tx.hash for it in self.items)
+        return [s for h, ss in self.multi if sorted(h) == all_hashes for s in ss]
 
     def merge(self, other: "TopologyBundle") -> int:
         if [it.tx.serialized for it in self.items] != [it.tx.serialized for it in other.items]:

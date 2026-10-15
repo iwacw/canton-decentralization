@@ -31,6 +31,8 @@ PERMISSION_RANK = {PERMISSIONS["observation"]: 1, PERMISSIONS["confirmation"]: 2
 
 USAGE_NAMESPACE = cpb.SIGNING_KEY_USAGE_NAMESPACE
 USAGE_PROTOCOL = cpb.SIGNING_KEY_USAGE_PROTOCOL
+# Canton normalizes party signing keys to PROTOCOL + PROOF_OF_OWNERSHIP (seen in GenerateTransactions).
+PARTY_KEY_USAGE = [cpb.SIGNING_KEY_USAGE_PROTOCOL, cpb.SIGNING_KEY_USAGE_PROOF_OF_OWNERSHIP]
 
 CODE_NSD = tpb.Enums.TOPOLOGY_MAPPING_CODE_NAMESPACE_DELEGATION
 CODE_DNS = tpb.Enums.TOPOLOGY_MAPPING_CODE_DECENTRALIZED_NAMESPACE_DEFINITION
@@ -131,7 +133,9 @@ def party_to_participant(
             hp.onboarding.SetInParent()
     if signing_keys:
         p2p.party_signing_keys.threshold = signing_threshold or 1
-        p2p.party_signing_keys.keys.extend(k.to_proto([USAGE_PROTOCOL]) for k in signing_keys)
+        # Canton serializes the key set sorted by fingerprint (SigningKeysWithThreshold.toProtoV30)
+        keys = sorted(set(signing_keys), key=lambda k: k.fingerprint)
+        p2p.party_signing_keys.keys.extend(k.to_proto(PARTY_KEY_USAGE) for k in keys)
     mapping = tpb.TopologyMapping(party_to_participant=p2p)
     validate_mapping(mapping)
     return mapping
