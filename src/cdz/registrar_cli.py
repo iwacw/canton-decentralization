@@ -297,6 +297,8 @@ def cmd_transfers(args):
             and h["instrument"] == args.instrument and not h["locked"]]
     assignment = assign_exact_holdings(rows, mine)
     if assignment is None:
+        if getattr(args, "_after_split", False):
+            raise U.UtilitiesError("exact-amount holdings are not visible yet after the split/merge; rerun in a moment")
         total = sum(Decimal(r["amount"]) for r in rows)
         big = sorted(mine, key=lambda h: Decimal(h["amount"]), reverse=True)
         if not big or Decimal(big[0]["amount"]) < total:
@@ -307,14 +309,20 @@ def cmd_transfers(args):
                                  f"Merge {len(big)} holdings of {args.instrument} before splitting", lc=lc)
             c.write_bundle(b, outdir / "00-merge.json")
             print("step 1/3: sign+execute 00-merge.json, then rerun this command", file=sys.stderr)
-            return
-        b = c.prepare_bundle(s, p, U.holding_split(big[0]["contract_id"], [r["amount"] for r in rows]),
-                             f"Split {big[0]['amount']} {args.instrument} into {len(rows)} exact amounts for the CSV", lc=lc)
-        c.write_bundle(b, outdir / "00-split.json")
-        print("step 2/3: sign+execute 00-split.json, then rerun this command to prepare the transfers", file=sys.stderr)
+        else:
+            b = c.prepare_bundle(s, p, U.holding_split(big[0]["contract_id"], [r["amount"] for r in rows]),
+                                 f"Split {big[0]['amount']} {args.instrument} into {len(rows)} exact amounts for the CSV", lc=lc)
+            c.write_bundle(b, outdir / "00-split.json")
+            print("step 2/3: sign+execute 00-split.json, then rerun this command to prepare the transfers", file=sys.stderr)
         if args.execute:
             c.finish_prepared(args, s, b)
-            time.sleep(2)
+            for _ in range(10):  # wait until the new holdings are visible, never split twice
+                time.sleep(2)
+                mine = [h for h in _holdings(lc, p.party_id) if h["owner"] == p.party_id and h["admin"] == p.party_id
+                        and h["instrument"] == args.instrument and not h["locked"]]
+                if assign_exact_holdings(rows, mine) is not None or len(mine) == 1:
+                    break
+            args._after_split = "split" in b.description.lower()
             return cmd_transfers(args)
         return
     manifest = []
@@ -324,8 +332,9 @@ def cmd_transfers(args):
         manifest.append({"line": r["line"], "receiver": r["receiver"], "amount": r["amount"], "bundle": str(out), "input": assignment[r["line"]]})
         if args.execute:
             b.sign(s.protocol_keys())
+            r = c.execute_bundle(s, b, None)
+            b.meta["executed"] = {"update_id": r.get("updateId"), "offset": r.get("completionOffset")}
             c.write_bundle(b, out)
-            c.execute_bundle(s, b, None)
     (outdir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     print(f"prepared {len(manifest)} transfer bundles in {outdir} (manifest.json); sign them with `cdz bundle sign {outdir}/0*.json`", file=sys.stderr)
 

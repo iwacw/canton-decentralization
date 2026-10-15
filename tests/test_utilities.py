@@ -170,6 +170,10 @@ class FakeLedger:
 
     def execute_and_wait(self, prepared_b64, party, sigs, scheme):
         self.executed.append((party, [s.signed_by for s in sigs]))
+        root = isp.PreparedTransaction.FromString(base64.b64decode(prepared_b64)).transaction.nodes[0].v1
+        if root.WhichOneof("node_type") == "exercise" and root.exercise.choice_id == "Holding_Split":
+            amounts = [e.text for e in root.exercise.chosen_value.record.fields[0].value.list.elements]
+            self.acs = [_holding(f"split{i}", a, party) for i, a in enumerate(amounts)] + [_holding("rest", "1", party)]
         return {"updateId": "u%d" % len(self.executed), "completionOffset": len(self.executed)}
 
 
@@ -279,3 +283,14 @@ def test_intent_argument_check():
     v.record.fields[1].value.CopyFrom(vp.Value(timestamp=1767225600000000))
     assert prepared.compare_value({"amount": "10", "when": "2026-01-01T00:00:00Z"}, v) == []
     assert prepared.compare_value({"amount": "11"}, v) == ["$.amount: 10.0000000000 != 11"]
+
+
+def test_cli_csv_transfers_execute_end_to_end(env, monkeypatch, tmp_path):
+    party = env.party_id
+    (tmp_path / "pay.csv").write_text(f"receiver,amount\n{ALICE},10\n{BOB},2.5\n")
+    lc, reg = _wire(monkeypatch, [_holding("big", "100", party)])
+    monkeypatch.setattr(registrar_cli.time, "sleep", lambda s: None)
+    assert cli.main(["registrar", "transfers", "--csv", "pay.csv", "--instrument", "TOK", "--out-dir", "out", "--execute", "--yes"]) == 0
+    chosen = [json.loads((tmp_path / m["bundle"]).read_text())["meta"]["executed"] for m in json.loads((tmp_path / "out/manifest.json").read_text())]
+    assert len(lc.executed) == 3 and len(chosen) == 2  # split + two transfers
+    assert [c for c, _ in reg.calls] == ["factory", "factory"]

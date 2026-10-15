@@ -14,6 +14,7 @@ from pathlib import Path
 from cdz import __version__, bundle, crypto, manage, prepared, topology
 from cdz.config import ConfigError, Settings
 from cdz.party import Member, PartySpec
+from cdz.utilities import UtilitiesError
 
 
 class CliError(Exception):
@@ -508,16 +509,20 @@ def prepare_bundle(s: Settings, p: PartySpec, command: dict, description: str, d
 
 def finish_prepared(args, s: Settings, b: bundle.SubmissionBundle) -> None:
     """Write the bundle; with --execute, sign with local keys and execute if the threshold is met."""
-    if args.output:
-        write_bundle(b, args.output)
+    output = getattr(args, "output", None)
+    if output:
+        write_bundle(b, output)
     show_submission(b)
     if getattr(args, "execute", False):
         keys = s.protocol_keys()
         confirm(args, f"Sign with {len(keys)} local key(s) and execute?")
         b.sign(keys)
-        if args.output:
-            write_bundle(b, args.output)
-        execute_bundle(s, b, None)
+        if output:
+            write_bundle(b, output)
+        r = execute_bundle(s, b, None)
+        b.meta["executed"] = {"update_id": r.get("updateId"), "offset": r.get("completionOffset")}
+        if output:
+            write_bundle(b, output)
 
 
 def execute_bundle(s: Settings, b: bundle.SubmissionBundle, url: str | None):
@@ -735,12 +740,14 @@ def main(argv=None) -> int:
     try:
         args.fn(args)
         return 0
-    except (CliError, ConfigError, bundle.BundleError, topology.TopologyError, manage.PlanError, prepared.PreparedCheckError) as e:
+    except (CliError, ConfigError, bundle.BundleError, topology.TopologyError, manage.PlanError,
+            prepared.PreparedCheckError, UtilitiesError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
     except Exception as e:  # network/API errors: concise message
         name = type(e).__name__
-        if name in ("LedgerError", "AdminError", "HashError", "URLError", "HTTPError", "ConnectionRefusedError"):
+        if name in ("LedgerError", "AdminError", "RegistryError", "URLError", "HTTPError", "TimeoutError",
+                    "ConnectionRefusedError", "ConnectionResetError", "RemoteDisconnected"):
             print(f"error: {e}", file=sys.stderr)
             return 3
         raise
