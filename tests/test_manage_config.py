@@ -5,7 +5,6 @@ import pytest
 
 from cdz import authz, config, crypto, manage, topology
 from cdz.party import Member, PartySpec
-from cdz.topology import Tx
 
 P1 = "participant1::1220" + "11" * 32
 P2 = "participant2::1220" + "22" * 32
