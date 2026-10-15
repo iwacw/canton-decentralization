@@ -100,6 +100,14 @@ def required(tx: Tx, state: State):
     raise ValueError(f"no authorization model for mapping {kind}")
 
 
+def _signing_keys_value(p: tpb.PartyToParticipant | None):
+    if p is None or not p.HasField("party_signing_keys"):
+        return None
+    ks = p.party_signing_keys
+    keys = frozenset((crypto.PublicKey.from_proto(k).fingerprint, frozenset(k.usage)) for k in ks.keys)
+    return ks.threshold, keys
+
+
 def _p2p_required(tx: Tx, prev: tpb.PartyToParticipant | None):
     cur = tx.mapping.party_to_participant
     party_ns = split_uid(cur.party)[1]
@@ -111,10 +119,8 @@ def _p2p_required(tx: Tx, prev: tpb.PartyToParticipant | None):
         parts.append(party)
     cur_keys = {crypto.PublicKey.from_proto(k).fingerprint for k in cur.party_signing_keys.keys}
     prev_keys = {crypto.PublicKey.from_proto(k).fingerprint for k in prev.party_signing_keys.keys} if prev else set()
-    cur_ks = cur.party_signing_keys if cur.HasField("party_signing_keys") else None
-    prev_ks = prev.party_signing_keys if prev is not None and prev.HasField("party_signing_keys") else None
     added_keys = sorted(cur_keys - prev_keys)
-    if cur_ks != prev_ks:
+    if _signing_keys_value(cur) != _signing_keys_value(prev):  # set semantics, like Canton
         parts.append(_and(party, *[("key", k) for k in added_keys]))
     cur_hosts = {h.participant_uid: h for h in cur.participants}
     prev_hosts = {h.participant_uid: h for h in prev.participants} if prev else {}
