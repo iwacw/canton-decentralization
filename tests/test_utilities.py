@@ -108,16 +108,33 @@ def _ident(tid: str) -> vp.Identifier:
     return vp.Identifier(package_id="pkgid-" + pkg, module_name=mod, entity_name=ent)
 
 
+def json_to_value(j) -> vp.Value:
+    """Untyped JSON -> Ledger API Value, enough for the fake node to echo arguments back."""
+    if j is None:
+        return vp.Value(optional=vp.Optional())
+    if isinstance(j, bool):
+        return vp.Value(bool=j)
+    if isinstance(j, int):
+        return vp.Value(int64=j)
+    if isinstance(j, str):
+        return vp.Value(text=j)
+    if isinstance(j, list):
+        return vp.Value(list=vp.List(elements=[json_to_value(x) for x in j]))
+    if isinstance(j, dict) and set(j) == {"tag", "value"}:
+        return vp.Value(variant=vp.Variant(constructor=j["tag"], value=json_to_value(j["value"])))
+    return vp.Value(record=vp.Record(fields=[vp.RecordField(label=k, value=json_to_value(v)) for k, v in j.items()]))
+
+
 def fake_prepared(party: str, command: dict) -> isp.PreparedTransaction:
     ((kind, body),) = command.items()
     tx = isp.DamlTransaction(version="2.1", roots=["0"])
     if kind == "CreateCommand":
         node = nd.Node(create=nd.Create(lf_version="2.1", contract_id="00" + "11" * 32, package_name="p",
-                                        template_id=_ident(body["templateId"]), argument=vp.Value(text="x"),
+                                        template_id=_ident(body["templateId"]), argument=json_to_value(body["createArguments"]),
                                         signatories=[party], stakeholders=[party]))
     else:
         e = nd.Exercise(lf_version="2.1", contract_id=body["contractId"], package_name="p", choice_id=body["choice"],
-                        chosen_value=vp.Value(text="x"), consuming=True, acting_parties=[party],
+                        chosen_value=json_to_value(body["choiceArgument"]), consuming=True, acting_parties=[party],
                         signatories=[party], stakeholders=[party])
         if "Splice.Api" in body["templateId"]:
             e.interface_id.CopyFrom(_ident(body["templateId"]))
@@ -244,3 +261,21 @@ def test_cli_csv_transfers_split_then_bundles(env, monkeypatch, tmp_path):
 def test_cli_refuses_wrong_network(env, monkeypatch):
     _wire(monkeypatch, [])
     assert cli.main(["--network", "mainnet", "registrar", "holdings"]) == 2
+
+
+def test_intent_argument_check():
+    from cdz import prepared
+
+    cmd = U.registrar_service_request(OP, BOB, REG)
+    p = fake_prepared(REG, cmd)
+    prepared.check(p, tx_hash.V2, None, REG, cmd)
+    # a node that swaps the provider is caught even though the hash matches its own transaction
+    evil = json.loads(json.dumps(cmd))
+    evil["CreateCommand"]["createArguments"]["provider"] = ALICE
+    with pytest.raises(prepared.PreparedCheckError, match="provider"):
+        prepared.check(fake_prepared(REG, evil), tx_hash.V2, None, REG, cmd)
+    v = json_to_value({"amount": "10", "when": "2026-01-01T00:00:00Z"})
+    v.record.fields[0].value.CopyFrom(vp.Value(numeric="10.0000000000"))
+    v.record.fields[1].value.CopyFrom(vp.Value(timestamp=1767225600000000))
+    assert prepared.compare_value({"amount": "10", "when": "2026-01-01T00:00:00Z"}, v) == []
+    assert prepared.compare_value({"amount": "11"}, v) == ["$.amount: 10.0000000000 != 11"]

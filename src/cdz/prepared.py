@@ -164,6 +164,79 @@ def check(
     return h
 
 
+def _micros(text: str) -> int | None:
+    import datetime as dt
+
+    try:
+        t = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if t.tzinfo is None:
+        return None
+    return int(t.timestamp()) * 1_000_000 + t.microsecond
+
+
+def compare_value(want, v, path: str = "$") -> list[str]:
+    """Best-effort check that a JSON (Daml-LF JSON) value matches a Ledger API Value.
+
+    Only what the JSON states is compared (omitted record fields are ignored); returns the
+    paths that definitely differ."""
+    k = v.WhichOneof("sum")
+    if want is None:
+        return [] if k in (None, "unit") or (k == "optional" and not v.optional.HasField("value")) else [f"{path}: expected none"]
+    if k == "optional":
+        return compare_value(want, v.optional.value, path) if v.optional.HasField("value") else [f"{path}: missing value"]
+    if k == "record":
+        if not isinstance(want, dict):
+            return [f"{path}: expected record"]
+        fields = {f.label: f.value for f in v.record.fields}
+        out = []
+        for key, sub in want.items():
+            if key not in fields:
+                if fields and all(fields):  # labelled record without that field
+                    out.append(f"{path}.{key}: not in transaction")
+                continue
+            out += compare_value(sub, fields[key], f"{path}.{key}")
+        return out
+    if k == "variant":
+        if isinstance(want, dict) and "tag" in want:
+            if want["tag"] != v.variant.constructor:
+                return [f"{path}: variant {v.variant.constructor} != {want['tag']}"]
+            return compare_value(want.get("value"), v.variant.value, f"{path}.{want['tag']}")
+        return []
+    if k == "list":
+        if not isinstance(want, list):
+            return [f"{path}: expected list"]
+        if len(want) != len(v.list.elements):
+            return [f"{path}: {len(v.list.elements)} elements != {len(want)}"]
+        return [m for i, (a, b) in enumerate(zip(want, v.list.elements, strict=True)) for m in compare_value(a, b, f"{path}[{i}]")]
+    if k == "text_map":
+        if not isinstance(want, dict):
+            return [f"{path}: expected map"]
+        got = {e.key: e.value for e in v.text_map.entries}
+        if set(got) != set(want):
+            return [f"{path}: keys {sorted(got)} != {sorted(want)}"]
+        return [m for key in want for m in compare_value(want[key], got[key], f"{path}.{key}")]
+    if k == "numeric":
+        try:
+            return [] if Decimal(str(want)) == Decimal(v.numeric) else [f"{path}: {v.numeric} != {want}"]
+        except Exception:
+            return [f"{path}: not a number: {want!r}"]
+    if k == "int64":
+        return [] if str(want) == str(v.int64) else [f"{path}: {v.int64} != {want}"]
+    if k == "timestamp":
+        m = _micros(str(want))
+        return [] if m is None or m == v.timestamp else [f"{path}: timestamp differs"]
+    if k in ("text", "party", "contract_id"):
+        got = getattr(v, k)
+        return [] if want == got else [f"{path}: {got!r} != {want!r}"]
+    if k == "bool":
+        return [] if want is v.bool else [f"{path}: {v.bool} != {want}"]
+    if k == "enum":
+        return [] if want == v.enum.constructor else [f"{path}: {v.enum.constructor} != {want}"]
+    return []  # date, gen_map, unit: not compared
+
+
 def _check_intent(p: isp.PreparedTransaction, command: dict) -> None:
     """`command` is the JSON Ledger API command that was prepared ({"CreateCommand": {...}} etc.)."""
     ((cmd_kind, body),) = command.items()
@@ -178,6 +251,9 @@ def _check_intent(p: isp.PreparedTransaction, command: dict) -> None:
         got = root.create.template_id
         if module_entity and f"{got.module_name}:{got.entity_name}" != module_entity:
             raise PreparedCheckError(f"creates {tid(got)}, expected {want}")
+        diffs = compare_value(body.get("createArguments"), root.create.argument)
+        if diffs:
+            raise PreparedCheckError("create arguments differ from the request: " + "; ".join(diffs[:5]))
     elif cmd_kind == "ExerciseCommand":
         if kind != "exercise":
             raise PreparedCheckError(f"root node is {kind}, expected exercise")
@@ -189,5 +265,8 @@ def _check_intent(p: isp.PreparedTransaction, command: dict) -> None:
         target = e.interface_id if e.HasField("interface_id") else e.template_id
         if module_entity and f"{target.module_name}:{target.entity_name}" != module_entity:
             raise PreparedCheckError(f"root exercises on {tid(target)}, expected {want}")
+        diffs = compare_value(body.get("choiceArgument"), e.chosen_value)
+        if diffs:
+            raise PreparedCheckError("choice argument differs from the request: " + "; ".join(diffs[:5]))
     else:
         raise PreparedCheckError(f"unsupported command kind {cmd_kind}")

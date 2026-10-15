@@ -124,20 +124,32 @@ class LedgerClient:
             cum = [{"identifierFilter": {"WildcardFilter": {"value": {"includeCreatedEventBlob": include_blob}}}}]
         fmt = {"filtersByParty": {party: {"cumulative": cum}}, "verbose": True}
         out, token, offset = [], None, None
+
+        def collect(entries):
+            for entry in entries:
+                ac = (entry.get("contractEntry") or {}).get("JsActiveContract")
+                if ac:
+                    ev = ac["createdEvent"]
+                    ev["synchronizerId"] = ac.get("synchronizerId")
+                    out.append(ev)
+
         while True:
             body = {"eventFormat": fmt, "maxPageSize": page_size}
             if token:
                 body["pageToken"] = token
             if offset is not None:
                 body["activeAtOffset"] = offset
-            r = self._req("POST", "/v2/state/active-contracts-page", body)
+            try:
+                r = self._req("POST", "/v2/state/active-contracts-page", body)
+            except LedgerError as e:
+                if e.status != 404 or token:
+                    raise
+                # Canton 3.4: no paged endpoint; one snapshot at the ledger end
+                r = self._req("POST", "/v2/state/active-contracts", {"eventFormat": fmt, "activeAtOffset": self.ledger_end()})
+                collect(r if isinstance(r, list) else [])
+                return out
             offset = r.get("activeAtOffset", offset)
-            for entry in r.get("activeContracts", []):
-                ac = (entry.get("contractEntry") or {}).get("JsActiveContract")
-                if ac:
-                    ev = ac["createdEvent"]
-                    ev["synchronizerId"] = ac.get("synchronizerId")
-                    out.append(ev)
+            collect(r.get("activeContracts", []))
             token = r.get("nextPageToken")
             if not token:
                 return out
