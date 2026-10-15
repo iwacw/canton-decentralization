@@ -155,8 +155,9 @@ Roles in this runbook:
 4. **Allocate on every host.** Each CPN operator runs this with an admin token for their own
    node:
    ```bash
-   cdz party allocate onboard.signed.json --ledger-url https://p1…/ --user acme-registrar-app
+   cdz party allocate onboard.signed.json --ledger-url https://p1…/
    ```
+   (`--user <existing ledger user>` also grants that user actAs on the new party.)
    The party becomes active once all hosts have allocated. Check with `cdz party status`:
    serials, hosts, thresholds, pending proposals, and drift against `party.json`.
 
@@ -166,8 +167,8 @@ Roles in this runbook:
    cdz topology approve --hash <p2p hash> --admin-addr <each host>
    ```
 
-5. **App user.** Each CPN operator grants the coordinator's ledger user read and execute
-   rights on their node:
+5. **App user.** Once the party is active, each CPN operator grants the coordinator's ledger
+   user read and execute rights on their node:
    ```bash
    cdz party grant-user --user acme-registrar-app --create
    ```
