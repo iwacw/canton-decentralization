@@ -66,7 +66,8 @@ def ledger(s: Settings, url: str | None = None):
 def admin_client(s: Settings, addr: str | None = None):
     from cdz.admin import AdminClient
 
-    return AdminClient(addr or s.require("admin_addr", "CDZ_ADMIN_ADDR"), tls=s.admin_tls, ca_file=s.admin_ca)
+    return AdminClient(addr or s.require("admin_addr", "CDZ_ADMIN_ADDR"), tls=s.admin_tls, ca_file=s.admin_ca,
+                       cert_file=s.env.get("CDZ_ADMIN_CERT") or None, key_file=s.env.get("CDZ_ADMIN_KEY") or None)
 
 
 def sync_id(s: Settings, lc=None) -> str:

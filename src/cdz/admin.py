@@ -54,10 +54,14 @@ def item(res):
 
 
 class AdminClient:
-    def __init__(self, target: str, tls: bool = False, ca_file: str | None = None, timeout: float = 30.0):
+    def __init__(self, target: str, tls: bool = False, ca_file: str | None = None, timeout: float = 30.0,
+                 cert_file: str | None = None, key_file: str | None = None):
         if tls:
-            ca = open(ca_file, "rb").read() if ca_file else None
-            self.channel = grpc.secure_channel(target, grpc.ssl_channel_credentials(root_certificates=ca))
+            def read(f):
+                return open(f, "rb").read() if f else None
+
+            creds = grpc.ssl_channel_credentials(read(ca_file), read(key_file), read(cert_file))  # mTLS if cert+key
+            self.channel = grpc.secure_channel(target, creds)
         else:
             self.channel = grpc.insecure_channel(target)
         self.read = rdg.TopologyManagerReadServiceStub(self.channel)
