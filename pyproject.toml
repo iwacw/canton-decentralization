@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "canton-decentralization"
+version = "0.1.0"
+description = "Canton external party with a decentralized namespace, operated as a DA Utilities registrar"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "grpcio>=1.68.1",
+  "protobuf>=5.28,<6",
+  "cryptography>=42",
+  "googleapis-common-protos>=1.63",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "grpcio-tools==1.68.1"]
+
+[project.scripts]
+cdz = "cdz.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+cdz = ["networks/*.toml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
