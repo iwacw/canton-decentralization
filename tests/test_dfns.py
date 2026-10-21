@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import struct
+import time
 
 import pytest
 from cryptography.hazmat.primitives import hashes, serialization
@@ -17,6 +18,12 @@ from cdz import bundle, cli, crypto, dfns
 def gateway_fingerprint(raw32: bytes) -> str:
     """Wallet Gateway party-allocation-service.ts: 0x1220 || sha256(be32(12) || raw key)."""
     return "1220" + hashlib.sha256(struct.pack(">I", 12) + raw32).hexdigest()
+
+
+@pytest.fixture(autouse=True)
+def fast_sleep(monkeypatch):
+    real = time.sleep
+    monkeypatch.setattr(time, "sleep", lambda s: real(min(s, 0.005)))
 
 
 @pytest.fixture
@@ -306,7 +313,7 @@ def test_sign_bundle_onboarding_end_to_end(work, srv, onboarding, capsys):
 def test_sign_bundle_pending_then_signed(work, srv, onboarding, capsys):
     srv.mock.pending_polls = 2
     run(onboarding["env"], "dfns", "sign-bundle", "onboard.json", "--key-id", onboarding["key_id"], "-o", "out.json",
-        "--poll-interval", "0.01", "--yes")
+        "--poll-interval", "1", "--yes")
     err = capsys.readouterr().err
     assert "Pending" in err and "approval needed in DFNS" in err and "ap-mock0" in err and "(verified)" in err
     assert len(srv.mock.sig_requests()) == 1
@@ -315,7 +322,7 @@ def test_sign_bundle_pending_then_signed(work, srv, onboarding, capsys):
 def test_sign_bundle_pending_timeout_then_resume(work, srv, onboarding, capsys):
     srv.mock.approve = False
     rc = run(onboarding["env"], "dfns", "sign-bundle", "onboard.json", "--key-id", onboarding["key_id"], "-o", "out.json",
-             "--timeout", "0.05", "--poll-interval", "0.01", "--yes", ok=False)
+             "--timeout", "0.05", "--poll-interval", "1", "--yes", ok=False)
     err = capsys.readouterr().err
     assert rc == 3 and "--signature-id sig-" in err and not (work / "out.json").exists()
     sid = err.split("--signature-id ")[1].split()[0]
@@ -340,7 +347,8 @@ def test_sign_bundle_signature_encodings(work, srv, onboarding, encoding):
     srv.mock.encoding = encoding
     run(onboarding["env"], "dfns", "sign-bundle", "onboard.json", "--key-id", onboarding["key_id"], "-o", "out.json", "--yes")
     b = bundle.load(work / "out.json")
-    assert not b.prune()  # nothing invalid
+    fp = json.loads((work / "dfns-tx.pub.json").read_text())["fingerprint"]
+    assert not b.prune() and [s.signed_by for it in b.items if it.label == "p2p" for s in it.sigs] == [fp]
 
 
 def test_sign_bundle_key_not_needed_and_label_filter(work, srv, onboarding, capsys):
@@ -401,3 +409,98 @@ def test_sign_submission_bundle_and_execute(work, srv, onboarding, capsys, monke
     n = len(srv.mock.sig_requests())
     assert run(work / "dfns2.env", "dfns", "sign-bundle", "bad.json", "--key-id", o["key_id"], "-o", "x.json", "--yes", ok=False) == 2
     assert len(srv.mock.sig_requests()) == n
+
+
+# --- review follow-ups ----------------------------------------------------------------------
+
+
+def test_token_with_newline_never_printed(work, srv, capsys):
+    tok = srv.mock.token
+    (work / "tok").write_text(tok[:20] + "\n" + tok[20:] + "\n")
+    env = dfns_env(work, srv, "t.env")
+    env.write_text(env.read_text().replace(f"CDZ_DFNS_AUTH_TOKEN={tok}", "CDZ_DFNS_AUTH_TOKEN=file:tok"))
+    assert run(env, "dfns", "keys", "list", ok=False) == 2
+    o = capsys.readouterr()
+    assert "not a JWT" in o.err and tok[:20] not in o.out + o.err and tok[20:40] not in o.out + o.err
+    assert not srv.mock.requests
+
+
+def test_file_secrets_and_missing_file(work, srv, capsys):
+    (work / "tok").write_text(srv.mock.token + "\n")
+    (work / "sa.pem").write_text(srv.mock.private_key_pem())
+    env = dfns_env(work, srv, "f.env")
+    text = env.read_text()
+    text = "\n".join("CDZ_DFNS_AUTH_TOKEN=file:tok" if l.startswith("CDZ_DFNS_AUTH_TOKEN=") else
+                     "CDZ_DFNS_PRIVATE_KEY=file:sa.pem" if l.startswith("CDZ_DFNS_PRIVATE_KEY=") else l for l in text.splitlines())
+    env.write_text(text + "\n")
+    run(env, "dfns", "keys", "create", "--name", "via-files")
+    assert json.loads(capsys.readouterr().out)["name"] == "via-files"
+    env.write_text(text.replace("file:sa.pem", "file:missing.pem") + "\n")
+    assert run(env, "dfns", "keys", "create", "--name", "x", ok=False) == 2
+    assert "CDZ_DFNS_PRIVATE_KEY: cannot read missing.pem" in capsys.readouterr().err
+
+
+def test_base_url_with_path_prefix_signs_canonical_path(srv):
+    srv.mock.prefix = "/dfns-proxy/v1"
+    d = client(srv, CDZ_DFNS_BASE_URL=srv.url + "/dfns-proxy/v1/")
+    d.create_key("pfx")
+    init = json.loads(srv.mock.requests[0]["body"])
+    assert srv.mock.requests[2]["path"] == "/dfns-proxy/v1/keys" and init["userActionHttpPath"] == "/keys"
+
+
+def test_empty_allow_credentials_refused():
+    s = dfns.CredentialSigner("cr-1", _pem(ed25519.Ed25519PrivateKey.generate()))
+    with pytest.raises(dfns.DfnsConfigError, match="not among"):
+        s.assertion({"challenge": "x", "allowCredentials": {"key": [], "webauthn": []}})
+    assert s.assertion({"challenge": "x"})["kind"] == "Key"  # no allowCredentials at all: like the TS signer
+
+
+def test_wrong_signature_id_fails_before_any_request(work, srv, onboarding, capsys):
+    kid = onboarding["key_id"]
+    other = client(srv).generate_signature(kid, b"something else")["id"]
+    n = len(srv.mock.sig_requests())
+    assert run(onboarding["env"], "dfns", "sign-bundle", "onboard.json", "--key-id", kid, "-o", "o.json",
+               "--signature-id", other, "--yes", ok=False) == 2
+    assert "does not sign any hash" in capsys.readouterr().err and len(srv.mock.sig_requests()) == n
+
+
+def test_signature_id_rerun_on_signed_bundle_is_fine(work, srv, onboarding, capsys):
+    kid = onboarding["key_id"]
+    run(onboarding["env"], "dfns", "sign-bundle", "onboard.json", "--key-id", kid, "-o", "o.json", "--yes")
+    sid = next(iter(srv.mock.sigs))
+    run(onboarding["env"], "dfns", "sign-bundle", "o.json", "--key-id", kid, "-o", "o2.json", "--signature-id", sid, "--yes")
+    assert "already signed" in capsys.readouterr().err and len(srv.mock.sig_requests()) == 1
+
+
+def test_executing_failed_and_202(work, srv, onboarding, capsys):
+    kid = onboarding["key_id"]
+    srv.mock.pending_status, srv.mock.pending_polls = "Executing", 1
+    run(onboarding["env"], "dfns", "sign-bundle", "onboard.json", "--key-id", kid, "-o", "a.json", "--yes")
+    assert "Executing" in capsys.readouterr().err
+    srv.mock.fail = True
+    assert run(onboarding["env"], "dfns", "sign-bundle", "onboard.json", "--key-id", kid, "-o", "b.json", "--yes", ok=False) == 3
+    assert "Failed: signer unavailable" in capsys.readouterr().err and not (work / "b.json").exists()
+    srv.mock.fail, srv.mock.accept_202 = False, True
+    assert run(onboarding["env"], "dfns", "sign-bundle", "onboard.json", "--key-id", kid, "-o", "c.json", "--yes", ok=False) == 3
+    err = capsys.readouterr().err
+    assert "HTTP 202" in err and "approvalId" not in err and "ap-mock0" in err and not (work / "c.json").exists()
+
+
+def test_multi_item_timeout_lists_every_signature_id(srv):
+    m = srv.mock
+    kid = m.add_key("multi")
+    m.approve = False
+
+    class A:
+        timeout, poll_interval, signature_id = 0.05, 1, None
+
+    signer = __import__("cdz.dfns_cli", fromlist=["_Signer"])._Signer(client(srv), kid, A)
+    with pytest.raises(TimeoutError) as e:
+        signer.sign_all([("a", b"\x01"), ("b", b"\x02")])
+    ids = [r["id"] for r in m.sigs.values()]
+    assert len(ids) == 2 and all(f"--signature-id {i}" in str(e.value) for i in ids)
+
+
+def test_poll_interval_floor(work, srv, onboarding):
+    with pytest.raises(SystemExit):
+        cli.main(["--env", str(onboarding["env"]), "dfns", "sign-hash", "00", "--key-id", "k", "--poll-interval", "0"])

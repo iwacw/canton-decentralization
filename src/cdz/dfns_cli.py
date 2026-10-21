@@ -11,6 +11,7 @@ Credentials: CDZ_DFNS_AUTH_TOKEN (+ CDZ_DFNS_CRED_ID / CDZ_DFNS_PRIVATE_KEY for 
 
 from __future__ import annotations
 
+import argparse
 import json
 import re
 import sys
@@ -134,29 +135,40 @@ class _Signer:
                 raise _cli().CliError(f"{sid} is not a kind=Message signature request of {key_id}")
             self.existing[m] = r
 
-    def sign(self, data: bytes, label: str) -> crypto.Sig:
-        req = self.existing.pop(data, None)
-        if req is None:
-            req = self.d.generate_signature(self.key_id, data)
-            print(f"[{label}] DFNS signature request {req.get('id')}: {req.get('status')}", file=sys.stderr)
-        else:
-            print(f"[{label}] reusing DFNS signature request {req.get('id')}: {req.get('status')}", file=sys.stderr)
+    def check_reuse(self, needed: list[bytes], done: list[bytes] = ()) -> None:
+        """Before anything is requested: every --signature-id must sign a needed (or already signed) hash."""
+        for m in done:
+            self.existing.pop(m, None)
+        stray = [r.get("id", "?") for m, r in self.existing.items() if m not in needed]
+        if stray:
+            raise _cli().CliError(f"--signature-id {', '.join(stray)} does not sign any hash this key is still needed for")
 
-        def pending(r):
-            print(f"[{label}] {r.get('id')} is {r.get('status')}"
-                  f"{' (approval ' + r['approvalId'] + ')' if r.get('approvalId') else ''}: approval needed in DFNS; "
-                  f"waiting up to {self.args.timeout:.0f}s", file=sys.stderr)
+    def sign_all(self, items: list[tuple[str, bytes]]) -> list[crypto.Sig]:
+        """Create (or reuse) all signature requests first, then wait for each; verify every result."""
+        reqs = []
+        for label, data in items:
+            req = self.existing.pop(data, None)
+            verb = "reusing" if req else "new"
+            req = req or self.d.generate_signature(self.key_id, data)
+            print(f"[{label}] {verb} DFNS signature request {req.get('id')}: {req.get('status')}", file=sys.stderr)
+            reqs.append(req)
+        ids = " ".join(f"--signature-id {r.get('id')}" for r in reqs)
+        out = []
+        for (label, data), req in zip(items, reqs, strict=True):
+            def pending(r, label=label):
+                print(f"[{label}] {r.get('id')} is {r.get('status')}"
+                      f"{' (approval ' + r['approvalId'] + ')' if r.get('approvalId') else ''}: approval needed in DFNS; "
+                      f"waiting up to {self.args.timeout:.0f}s", file=sys.stderr)
 
-        req = self.d.wait_signature(self.key_id, req, self.args.timeout, self.args.poll_interval, pending)
-        try:
-            return dfns.verified_signature(self.key, data, req)
-        except ValueError as e:
-            raise _cli().CliError(str(e)) from None
-
-    def leftover(self) -> None:
-        if self.existing:
-            ids = ", ".join(r.get("id", "?") for r in self.existing.values())
-            raise _cli().CliError(f"--signature-id {ids} does not sign any hash this key is needed for")
+            try:
+                req = self.d.wait_signature(self.key_id, req, self.args.timeout, self.args.poll_interval, pending)
+            except TimeoutError as e:
+                raise TimeoutError(f"{e}; nothing written. After approval rerun with {ids}") from None
+            try:
+                out.append(dfns.verified_signature(self.key, data, req))
+            except ValueError as e:
+                raise _cli().CliError(str(e)) from None
+        return out
 
 
 def cmd_sign_bundle(args):
@@ -173,27 +185,31 @@ def cmd_sign_bundle(args):
         c.print_topology_bundle(b, p)
         idx = b.relevant(fp)
         if args.label:
-            unknown = set(args.label) - {b.items[i].label for i in range(len(b.items))}
+            unknown = set(args.label) - {it.label for it in b.items}
             if unknown:
                 raise c.CliError(f"no transaction labelled {', '.join(sorted(unknown))} in {args.bundle}")
             idx = [i for i in idx if b.items[i].label in args.label]
         if not idx:
             raise c.CliError(f"DFNS key {args.key_id} ({fp[:16]}…) is not needed by "
                              f"{'the selected transactions of ' if args.label else ''}{args.bundle}")
-        todo = [i for i in idx if not any(sg.signed_by == fp and signer.key.verify(sg.signature, b.items[i].tx.hash) for sg in b.items[i].sigs)]
+
+        def signed(i):
+            return any(sg.signed_by == fp and signer.key.verify(sg.signature, b.items[i].tx.hash) for sg in b.items[i].sigs)
+
+        todo = [i for i in idx if not signed(i)]
         for i in idx:
             if i not in todo:
                 print(f"[{b.items[i].label}] already signed by {signer.name}", file=sys.stderr)
+        signer.check_reuse([b.items[i].tx.hash for i in todo], [b.items[i].tx.hash for i in idx if i not in todo])
         if todo:
             for i in todo:
                 print(f"to sign with DFNS key {signer.name}: [{b.items[i].label}] {b.items[i].tx.hash.hex()}", file=sys.stderr)
             c.confirm(args, f"Request {len(todo)} DFNS signature(s) with {args.key_id}?")
-        for i in todo:
-            it = b.items[i]
-            sig = signer.sign(it.tx.hash, it.label)
-            it.sigs = [sg for sg in it.sigs if sg.signed_by != fp] + [sig]
-            print(f"signed: {it.label} <- {signer.name} (verified)", file=sys.stderr)
-        signer.leftover()
+            sigs = signer.sign_all([(b.items[i].label, b.items[i].tx.hash) for i in todo])
+            for i, sig in zip(todo, sigs, strict=True):
+                it = b.items[i]
+                it.sigs = [sg for sg in it.sigs if sg.signed_by != fp] + [sig]
+                print(f"signed: {it.label} <- {signer.name} (verified)", file=sys.stderr)
         c.write_bundle(b, args.output)
         ok = c.print_topology_bundle(b, p)
         print("status: " + ("fully signed" if ok else "incomplete (merge the other signers' copies)"), file=sys.stderr)
@@ -203,14 +219,15 @@ def cmd_sign_bundle(args):
         if fp not in {k.fingerprint for k in b.signing_keys}:
             raise c.CliError(f"DFNS key {args.key_id} ({fp[:16]}…) is not a signing key of {b.party}")
         c.show_submission(b, synchronizer_id=s.synchronizer_id)
-        if any(sg.signed_by == fp and signer.key.verify(sg.signature, h) for sg in b.sigs):
+        done = any(sg.signed_by == fp and signer.key.verify(sg.signature, h) for sg in b.sigs)
+        signer.check_reuse([] if done else [h], [h] if done else [])
+        if done:
             print(f"already signed by {signer.name}", file=sys.stderr)
         else:
             c.confirm(args, f"Sign this transaction for {b.party} with DFNS key {args.key_id}?")
-            sig = signer.sign(h, "tx")
+            (sig,) = signer.sign_all([("tx", h)])
             b.sigs = [sg for sg in b.sigs if sg.signed_by != fp] + [sig]
             print(f"signed: tx <- {signer.name} (verified)", file=sys.stderr)
-        signer.leftover()
         c.write_bundle(b, args.output)
         c.show_submission(b, synchronizer_id=s.synchronizer_id)
 
@@ -225,14 +242,21 @@ def cmd_sign_hash(args):
     if not data:
         raise c.CliError("empty message")
     signer = _Signer(client(s), args.key_id, args)
+    signer.check_reuse([data])
     c.confirm(args, f"Request a DFNS signature with {args.key_id} over {data.hex()}?")
-    sig = signer.sign(data, "hash")
-    signer.leftover()
+    (sig,) = signer.sign_all([("hash", data)])
     c.out({"message": data.hex(), "key_id": args.key_id, "verified": True,
            "signature_hex": sig.signature.hex(), "signature": sig.to_json()})
 
 
 # --- parser ---------------------------------------------------------------------------------
+
+
+def _interval(text: str) -> float:
+    v = float(text)
+    if v < 1:
+        raise argparse.ArgumentTypeError("must be >= 1 second")
+    return v
 
 
 def register(sub, add, yes):
@@ -256,7 +280,7 @@ def register(sub, add, yes):
         p.add_argument("--key-id", required=True, help="DFNS key id (key-…)")
         p.add_argument("--signature-id", action="append", help="reuse an existing DFNS signature request (e.g. after approval)")
         p.add_argument("--timeout", type=float, default=600, help="seconds to wait for a pending approval (default 600)")
-        p.add_argument("--poll-interval", type=float, default=3)
+        p.add_argument("--poll-interval", type=_interval, default=3, help="seconds between status polls (>= 1)")
         yes(p)
 
     p = add(top, "sign-bundle", cmd_sign_bundle, "DFNS-sign what a bundle needs from the key; verified before writing")

@@ -55,6 +55,10 @@ class MockDfns:
         self.encoding = "encoded"  # encoded | rs | 0x
         self.bad_public_key = False
         self.page = 2
+        self.prefix = ""  # deployment path prefix of the base URL, stripped before routing
+        self.pending_status = "Pending"  # or Executing
+        self.fail = False  # signature ends Failed
+        self.accept_202 = False  # POST /signatures answers 202 with an approval object
         self.lock = threading.Lock()
 
     # --- setup helpers ---------------------------------------------------------------------
@@ -105,6 +109,10 @@ class MockDfns:
             return 401, {"error": {"message": "Unauthorized"}}
         if not headers.get("user-agent"):
             return 400, {"error": {"message": "User-Agent must not be empty"}}
+        if self.prefix:
+            if not path.startswith(self.prefix + "/"):
+                return 404, {"error": {"message": "wrong prefix"}}
+            path = path[len(self.prefix):]
         route, _, query = path.partition("?")
         q = dict(p.split("=", 1) for p in query.split("&") if p)
         parts = route.strip("/").split("/")
@@ -113,7 +121,7 @@ class MockDfns:
             return 302, {"location": "http://127.0.0.1:1/stolen"}
         if route == "/auth/action/init" and method == "POST":
             need = {"userActionPayload", "userActionHttpMethod", "userActionHttpPath"}
-            if not need <= set(body) or set(body) - need - {"userActionServerKind"}:
+            if set(body) != need | {"userActionServerKind"} or body["userActionServerKind"] != "Api":
                 return 400, {"error": {"message": "bad init body"}}
             ch = b64url(secrets.token_bytes(32))
             cid = "eyJ" + secrets.token_hex(16)
@@ -179,8 +187,10 @@ class MockDfns:
                 return 404, {"error": {"message": "Key not found"}}
             if body.get("kind") != "Message":
                 return 400, {"error": {"message": "only Message in the mock"}}
+            if self.accept_202:
+                return 202, {"id": "ap-mock0-mock0-0000000000000001", "status": "Pending", "activityId": "x"}
             sid = self._id("sig")
-            req = {"id": sid, "keyId": kid, "requester": {"userId": "us-x"}, "requestBody": body, "status": "Pending",
+            req = {"id": sid, "keyId": kid, "requester": {"userId": "us-x"}, "requestBody": body, "status": self.pending_status,
                    "dateRequested": "2026-10-21T00:00:00Z", "_polls": self.pending_polls}
             self.sigs[sid] = req
             self._progress(req, first=True)
@@ -194,7 +204,10 @@ class MockDfns:
         return 404, {"error": {"message": f"no route {method} {route}"}}
 
     def _progress(self, req, first=False):
-        if req["status"] != "Pending":
+        if req["status"] not in ("Pending", "Executing"):
+            return
+        if self.fail:
+            req.update(status="Failed", reason="signer unavailable")
             return
         if self.reject:
             req.update(status="Rejected", reason="policy rejected")

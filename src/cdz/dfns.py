@@ -24,6 +24,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -43,6 +44,8 @@ SIGNED_STATES = ("Signed", "Confirmed")
 PENDING_STATES = ("Pending", "Executing")
 FAILED_STATES = ("Failed", "Rejected")
 _LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
+_TOKEN = re.compile(r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*")
+_HEADER_SAFE = re.compile(r"[\x21-\x7e]+")
 
 
 class DfnsError(RuntimeError):
@@ -63,20 +66,25 @@ def unb64url(text: str) -> bytes:
     return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
 
 
-def _read_secret(value: str) -> str:
+def _read_secret(value: str, var: str) -> str:
     if value.startswith("file:"):
-        return Path(value[5:]).expanduser().read_text()
+        try:
+            return Path(value[5:]).expanduser().read_text()
+        except OSError as e:
+            raise DfnsConfigError(f"{var}: cannot read {value[5:]} ({e.strerror or type(e).__name__})") from None
     return value
 
 
 def token_scope(token: str) -> dict:
     """Unverified JWT payload claims DFNS puts in `https://custom/app_metadata` (orgId, ...)."""
+    if not _TOKEN.fullmatch(token):  # also keeps the token out of header-encoding errors
+        raise DfnsConfigError("CDZ_DFNS_AUTH_TOKEN is not a JWT (one line, three base64url parts)")
     try:
         payload = json.loads(unb64url(token.split(".")[1]))
-        meta = payload.get("https://custom/app_metadata") or {}
-        return meta if isinstance(meta, dict) else {}
-    except (IndexError, ValueError, UnicodeDecodeError):
+    except (ValueError, UnicodeDecodeError):
         raise DfnsConfigError("CDZ_DFNS_AUTH_TOKEN is not a JWT") from None
+    meta = payload.get("https://custom/app_metadata") if isinstance(payload, dict) else None
+    return meta if isinstance(meta, dict) else {}
 
 
 # --- credential (service account) signer ----------------------------------------------------
@@ -107,8 +115,9 @@ class CredentialSigner:
         return json.dumps(d, separators=(",", ":")).encode()
 
     def assertion(self, challenge: dict) -> dict:
-        allowed = [c.get("id") for c in (challenge.get("allowCredentials") or {}).get("key") or []]
-        if allowed and self.cred_id not in allowed:
+        allow = challenge.get("allowCredentials")
+        allowed = [c.get("id") for c in (allow.get("key") or [])] if isinstance(allow, dict) else None
+        if allowed is not None and self.cred_id not in allowed:  # as @dfns/sdk-keysigner
             raise DfnsConfigError(f"CDZ_DFNS_CRED_ID {self.cred_id} is not among the allowed credentials {allowed}")
         cd = self.client_data(challenge["challenge"])
         return {
@@ -145,7 +154,10 @@ Transport = Callable[[str, str, dict, "bytes | None", float], "tuple[int, bytes]
 
 def urllib_transport(method: str, url: str, headers: dict, body: bytes | None, timeout: float) -> tuple[int, bytes]:
     req = urllib.request.Request(url, data=body, method=method, headers=headers)
-    opener = urllib.request.build_opener(_NoRedirect)
+    handlers: list = [_NoRedirect]
+    if url.startswith("http:"):  # localhost only (checked): never hand the bearer token to an http proxy
+        handlers.append(urllib.request.ProxyHandler({}))
+    opener = urllib.request.build_opener(*handlers)
     try:
         with opener.open(req, timeout=timeout) as r:
             return r.status, r.read()
@@ -169,14 +181,14 @@ class DfnsConfig:
     @classmethod
     def from_env(cls, env=None) -> DfnsConfig:
         e = os.environ if env is None else env
-        token = _read_secret(e.get("CDZ_DFNS_AUTH_TOKEN", "")).strip()
+        token = _read_secret(e.get("CDZ_DFNS_AUTH_TOKEN", "").strip(), "CDZ_DFNS_AUTH_TOKEN").strip()
         pk = e.get("CDZ_DFNS_PRIVATE_KEY", "").strip()
         return cls(
             base_url=(e.get("CDZ_DFNS_BASE_URL") or DEFAULT_BASE_URL).strip(),
             auth_token=token,
             org_id=(e.get("CDZ_DFNS_ORG_ID") or "").strip() or None,
             cred_id=(e.get("CDZ_DFNS_CRED_ID") or "").strip() or None,
-            private_key=_read_secret(pk) if pk else None,
+            private_key=_read_secret(pk, "CDZ_DFNS_PRIVATE_KEY") if pk else None,
             app_origin=(e.get("CDZ_DFNS_APP_ORIGIN") or "").strip() or None,
             debug=(e.get("CDZ_DFNS_DEBUG") or "").lower() in ("1", "true", "yes"),
         )
@@ -205,6 +217,8 @@ class DfnsClient:
         self.org_id = token_scope(cfg.auth_token).get("orgId")
         if cfg.org_id and self.org_id != cfg.org_id:
             raise DfnsConfigError(f"the auth token is not scoped to CDZ_DFNS_ORG_ID {cfg.org_id}")
+        if cfg.cred_id and not _HEADER_SAFE.fullmatch(cfg.cred_id):
+            raise DfnsConfigError("CDZ_DFNS_CRED_ID contains whitespace or control characters")
         self._signer: CredentialSigner | None = None
         self._redact = list(cfg.secrets())
 
@@ -232,7 +246,10 @@ class DfnsClient:
         if payload is not None:
             headers["Content-Type"] = "application/json"
         headers.update(extra or {})
-        status, raw = self.transport(method, self.base + path, headers, payload.encode() if payload is not None else None, self.timeout)
+        try:
+            status, raw = self.transport(method, self.base + path, headers, payload.encode() if payload is not None else None, self.timeout)
+        except ValueError as e:  # e.g. http.client header checks echo header values: never show them
+            raise DfnsError(0, f"request not sent ({type(e).__name__}: {self._scrub(str(e))[:200]})", path.split("?")[0]) from None
         if self.cfg.debug:
             print(f"dfns: {method} {path.split('?')[0]} -> {status}", file=sys.stderr)
         try:
@@ -266,7 +283,7 @@ class DfnsClient:
             "challengeIdentifier": ch["challengeIdentifier"], "firstFactor": signer.assertion(ch),
         }, separators=(",", ":")))
         token = ua.get("userAction") if isinstance(ua, dict) else None
-        if not token:
+        if not isinstance(token, str) or not _HEADER_SAFE.fullmatch(token):
             raise DfnsError(0, "no userAction token in the /auth/action response", "/auth/action")
         self._redact.append(token)
         status, res = self._send(method, path, payload, {"X-DFNS-USERACTION": token})
@@ -296,15 +313,17 @@ class DfnsClient:
         """`kind: Message` over the exact bytes (hex, no 0x, as the Wallet Gateway sends it)."""
         path = f"/keys/{_seg(key_id)}/signatures"
         status, r = self.mutate("POST", path, {"kind": "Message", "message": message.hex()})
-        if not r.get("id"):
-            raise DfnsError(status, f"signature request not created ({_approval(r)})", path)
+        if not str(r.get("id", "")).startswith("sig-"):  # e.g. 202 + an approval object (TS SDK: PolicyPendingError)
+            raise DfnsError(status, f"no signature request returned ({_approval(r)}); if a policy approval is pending, "
+                            "approve it and rerun with --signature-id <sig-…> from the DFNS dashboard", path)
         return r
 
     def get_signature(self, key_id: str, sig_id: str) -> dict:
         return self.get(f"/keys/{_seg(key_id)}/signatures/{_seg(sig_id)}")
 
     def wait_signature(self, key_id: str, req: dict, timeout: float, interval: float = 3.0,
-                       on_pending: Callable[[dict], None] | None = None, sleep=time.sleep, clock=time.monotonic) -> dict:
+                       on_pending: Callable[[dict], None] | None = None, sleep=None, clock=time.monotonic) -> dict:
+        sleep = sleep or time.sleep
         deadline = clock() + timeout
         notified = False
         while True:
@@ -320,7 +339,7 @@ class DfnsClient:
                 notified = True
             if clock() >= deadline:
                 raise TimeoutError(f"DFNS signature {req.get('id')} still {st} after {timeout:.0f}s "
-                                   f"(approval {req.get('approvalId') or '-'}); rerun with --signature-id {req.get('id')}")
+                                   f"(approval {req.get('approvalId') or '-'})")
             sleep(interval)
             req = self.get_signature(key_id, req["id"])
 
