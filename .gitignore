@@ -22,3 +22,5 @@ dist/
 # local canton test runs
 tests/e2e/run/
 canton_ports.json
+
+.idea
