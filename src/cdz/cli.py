@@ -875,9 +875,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ledger-url")
     yes(p)
 
-    from cdz import registrar_cli
+    from cdz import dfns_cli, registrar_cli
 
     registrar_cli.register(sub, add, yes)
+    dfns_cli.register(sub, add, yes)
     return ap
 
 
@@ -893,7 +894,7 @@ def main(argv=None) -> int:
         return 2
     except Exception as e:  # network/API errors: concise message
         name = type(e).__name__
-        if name in ("LedgerError", "AdminError", "RegistryError", "URLError", "HTTPError", "TimeoutError",
+        if name in ("LedgerError", "AdminError", "RegistryError", "DfnsError", "URLError", "HTTPError", "TimeoutError",
                     "ConnectionRefusedError", "ConnectionResetError", "RemoteDisconnected"):
             print(f"error: {e}", file=sys.stderr)
             return 3

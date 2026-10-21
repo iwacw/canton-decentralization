@@ -244,3 +244,71 @@ def test_07_exercise_on_disclosed_contract(world):
         cdz(d, f"{who}.env", "bundle", "sign", "resp-v3.json", "--yes")
     r = cdz(d, "coord.env", "tx", "execute", "resp-v3.json", "--yes")
     assert json.loads(r.stdout)["executed"]
+
+
+@pytest.fixture(scope="module")
+def mock_dfns():
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from dfns_mock import MockServer
+
+    with MockServer() as s:
+        yield s
+
+
+def _wait_p2p(d, party_file, pred):
+    for _ in range(30):
+        st = json.loads(cdz(d, "coord.env", "--party", party_file, "party", "status").stdout)
+        if st["party_to_participant"] and pred(st["party_to_participant"]):
+            return st
+        time.sleep(1)
+    raise AssertionError(f"party state not reached: {st}")
+
+
+def test_08_dfns_held_signing_key(world, mock_dfns):
+    """DNS party whose only signing key is held by (mock) DFNS: onboard, transact, rotate to a new DFNS key."""
+    d = world["dir"]
+    common = dict(l.split("=", 1) for l in (d / "coord.env").read_text().split())
+    write_env(d / "dfns.env", **common, **mock_dfns.mock.env(mock_dfns.url))
+    pf = "party-dfns.json"
+    for i in range(3):  # fresh owners: the same owner set would give the namespace of the module's party
+        write_env(d / f"dfo{i}.env", **common)
+        cdz(d, f"dfo{i}.env", "keys", "generate", "--role", "ns", "--name", f"dfo{i}", "--env-out", f"dfo{i}.env", "--pub-out", f"dfo{i}.pub.json")
+    key1 = json.loads(cdz(d, "dfns.env", "dfns", "keys", "create", "--name", "dfnstx1", "--pub-out", "dfnstx1.pub.json").stdout)["id"]
+    r = cdz(d, "coord.env", "--party", pf, "party", "new", "--hint", "dfns-" + uuid.uuid4().hex[:6], "-o", pf,
+            *[a for i in range(3) for a in ("--owner", f"dfo{i}.pub.json")], "--owners-threshold", "2",
+            "--signing-key", "dfnstx1.pub.json", "--signing-threshold", "1",
+            "--host", world["parts"]["participant1"], "--confirmation-threshold", "1")
+    party = json.loads(r.stdout)["party_id"]
+    cdz(d, "coord.env", "--party", pf, "party", "onboard-bundle", "-o", "dfns-onb.json")
+    for i in range(3):
+        cdz(d, f"dfo{i}.env", "--party", pf, "bundle", "sign", "dfns-onb.json", "-o", f"dfns-onb.dfo{i}.json", "--yes")
+    cdz(d, "dfns.env", "--party", pf, "dfns", "sign-bundle", "dfns-onb.json", "--key-id", key1, "-o", "dfns-onb.dfns.json", "--yes")
+    cdz(d, "coord.env", "--party", pf, "bundle", "merge", "dfns-onb.signed.json", *[f"dfns-onb.dfo{i}.json" for i in range(3)], "dfns-onb.dfns.json")
+    assert "fully signed" in cdz(d, "coord.env", "--party", pf, "bundle", "show", "dfns-onb.signed.json").stdout
+    cdz(d, "coord.env", "--party", pf, "party", "allocate", "dfns-onb.signed.json", "--ledger-url", LEDGER[1], "--user", "cdz-e2e", "--yes")
+    fp1 = json.loads((d / "dfnstx1.pub.json").read_text())["fingerprint"]
+    st = _wait_p2p(d, pf, lambda p: True)
+    assert st["party_to_participant"]["signing_keys"] == [fp1] and not st["drift"]
+
+    def ping(tag, key_id):
+        args = json.dumps({"id": tag, "initiator": party, "responder": party})
+        cdz(d, "coord.env", "--party", pf, "tx", "prepare", "--create", PING, "--args", args, "-o", f"{tag}.json")
+        cdz(d, "dfns.env", "--party", pf, "dfns", "sign-bundle", f"{tag}.json", "--key-id", key_id, "-o", f"{tag}.signed.json", "--yes")
+        return json.loads(cdz(d, "coord.env", "--party", pf, "tx", "execute", f"{tag}.signed.json", "--yes").stdout)
+
+    assert ping("dfns-tx1", key1)["executed"]
+    # rotation: new DFNS key; owners (2-of-3) authorize, the new key proves ownership via DFNS
+    key2 = json.loads(cdz(d, "dfns.env", "dfns", "keys", "create", "--name", "dfnstx2", "--pub-out", "dfnstx2.pub.json").stdout)["id"]
+    fp2 = json.loads((d / "dfnstx2.pub.json").read_text())["fingerprint"]
+    cdz(d, "coord.env", "--party", pf, "topology", "plan-party", "--add-key", "dfnstx2.pub.json", "--remove-key", fp1, "-o", "dfns-rot.json")
+    for who in ("dfo1", "dfo2"):
+        cdz(d, f"{who}.env", "--party", pf, "bundle", "sign", "dfns-rot.json", "--yes")
+    cdz(d, "dfns.env", "--party", pf, "dfns", "sign-bundle", "dfns-rot.json", "--key-id", key2, "-o", "dfns-rot.json", "--yes")
+    cdz(d, "coord.env", "--party", pf, "topology", "submit", "dfns-rot.json", "--yes")
+    _wait_p2p(d, pf, lambda p: p["signing_keys"] == [fp2])
+    pj = json.loads((d / pf).read_text())  # party.json follows the rotation (submission bundles are checked against it)
+    pj["signing"]["keys"] = [{k: v for k, v in json.loads((d / "dfnstx2.pub.json").read_text()).items() if k in ("name", "spec", "spki", "fingerprint")}]
+    (d / pf).write_text(json.dumps(pj))
+    assert ping("dfns-tx2", key2)["executed"]
+    r = cdz(d, "dfns.env", "--party", pf, "dfns", "sign-bundle", "dfns-tx2.json", "--key-id", key1, "-o", "x.json", "--yes", ok=False)
+    assert r.returncode != 0 and "not a signing key" in r.stderr
