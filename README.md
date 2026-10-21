@@ -399,11 +399,13 @@ wallet links. Mitigations:
 
 Signing uses `POST /keys/{id}/signatures {"kind":"Message","message":"<hex>"}` over the exact
 bytes, with no pre-hash. For a topology transaction that is the full 34-byte multihash
-(`1220…`). This is what the gateway sends; `kind: Hash` would truncate it.
+(`1220…`). This is what the gateway sends; `kind: Hash` takes exactly 32 bytes, so it would reject this hash.
 
-A `Pending` or `Executing` signature (approval policy) is polled for up to `--timeout`
-seconds (600 by default). After a timeout or an approval, rerun with
-`--signature-id sig-…`: this reuses the signature request instead of creating a new one.
+A `Pending` or `Executing` signature (approval policy) is polled every `--poll-interval`
+seconds (at least 1) for up to `--timeout` seconds (600 by default). All requests of a bundle
+are created first. After a timeout, the error lists every `--signature-id sig-…` to rerun
+with; a rerun with them reuses those requests instead of creating new ones. Ids that do not
+match a hash the key still needs are refused before anything is requested.
 `Rejected`/`Failed` signatures, and signatures that do not verify, stop the command before
 anything is written.
 
