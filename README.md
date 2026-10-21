@@ -35,11 +35,12 @@ owner.
 4. [Runbook: MainNet](#runbook-mainnet)
 5. [Topology management](#topology-management)
 6. [Interactive submission](#interactive-submission)
-7. [Utilities flows and limits](#utilities-flows-and-limits)
-8. [Decentralization roadmap](#decentralization-roadmap)
-9. [Open questions for DA](#open-questions-for-da)
-10. [What is verified](#what-is-verified)
-11. [Development](#development)
+7. [DFNS](#dfns)
+8. [Utilities flows and limits](#utilities-flows-and-limits)
+9. [Decentralization roadmap](#decentralization-roadmap)
+10. [Open questions for DA](#open-questions-for-da)
+11. [What is verified](#what-is-verified)
+12. [Development](#development)
 
 ## Party model
 
@@ -342,6 +343,131 @@ Canton limits for external parties, quoted from the docs and the 3.5 protos:
 - "Only transactions requiring authorization from a single party are supported" /
   "only single party submissions are supported".
 
+## DFNS
+
+A party signing key (`role: tx`) can live in DFNS as a Keys API key (EdDSA/ed25519). The DNS
+owner keys stay offline, so DFNS can sign transactions but can never change who controls the
+party. The Wallet Gateway (1.12) DFNS provider then signs the party's transactions with that
+key. `cdz dfns …` covers the parts that need DFNS directly: create the key, export its public
+JSON, and get the proof-of-ownership and ad-hoc signatures. It has no extra dependencies.
+
+### Setup
+
+1. **A separate service account `dfns-key-admin`** for these commands. Do not reuse the
+   gateway's account.
+   - Give it its own keypair:
+     `openssl genpkey -algorithm Ed25519 -out key-admin.pem && openssl pkey -in key-admin.pem -pubout`.
+     P-256, secp256k1 and RSA PEMs also work.
+   - Its role needs `Keys:Create`, `Keys:Read`, `Keys:Signatures:Create` and
+     `Keys:Signatures:Read`.
+   - The token and PEM stay on the operator's machine. The gateway's account gets no
+     `Keys:Create`.
+2. **Environment** (in `.env`; `file:/path` works for the token and the key):
+
+   | Variable | Needed for | Notes |
+   |---|---|---|
+   | `CDZ_DFNS_AUTH_TOKEN` | all | service-account token (secret) |
+   | `CDZ_DFNS_CRED_ID` | create, sign | credential id `cr-…` of that token |
+   | `CDZ_DFNS_PRIVATE_KEY` | create, sign | credential private key, PEM (a one-line `\n` form is fine) or base64 PKCS#8 (secret) |
+   | `CDZ_DFNS_ORG_ID` | optional | refuse a token from another org |
+   | `CDZ_DFNS_BASE_URL` | optional | default `https://api.dfns.io` (https only, http only for localhost) |
+   | `CDZ_DFNS_APP_ORIGIN` | optional | adds `origin` to the signed client data, like the Python SDK |
+   | `CDZ_DFNS_DEBUG` | optional | logs method, path and status to stderr; never headers or bodies |
+
+### Risk: every ed25519 key in the org is reachable
+
+The gateway's DFNS provider lists **every Active EdDSA/ed25519 key in the org**. Its service
+account can request a signature from any of them, including keys behind other DFNS wallets
+(Solana, for example). `cdz dfns keys list --wallets` marks those keys `GW` and shows their
+wallet links. Mitigations:
+
+- Use a dedicated DFNS org for Canton keys, or at least keep no other ed25519 wallets in it.
+- Do not give the gateway account `Keys:Create`.
+- Add an approval policy (`RequestApproval`, `serviceAccountsCanApprove: false`). Whether a
+  `Wallets:Sign` policy also triggers for raw Keys API signatures is unverified, so test it on
+  a dev org first.
+
+### Commands
+
+| Command | What it does |
+|---|---|
+| `cdz dfns keys list [--json] [--all] [--wallets]` | Read-only. Lists id, scheme/curve, status, name, publicKey and the Canton fingerprint. `GW` marks keys the gateway can see. |
+| `cdz dfns keys create --name N --pub-out N.pub.json` | Creates an EdDSA/ed25519 key and writes the cdz public JSON. It checks that the key is 32 raw bytes and records the DFNS key id. |
+| `cdz dfns keys pub key-… --pub-out N.pub.json` | Writes the same public JSON for an existing Active key. |
+| `cdz dfns sign-bundle B.json --key-id key-… -o B.dfns.json [--label p2p]` | Signs only the hashes this key is needed for. On a topology bundle that is the proof of ownership in `p2p`, for onboarding and for a rotation that adds the key. On a `cdz tx prepare` bundle it is the transaction hash. Each signature is verified locally before the copy is written, so `cdz bundle merge` accepts it. |
+| `cdz dfns sign-hash <hex> --key-id key-…` | Ad-hoc signature over any hex message, verified locally and printed in cdz format. |
+
+Signing uses `POST /keys/{id}/signatures {"kind":"Message","message":"<hex>"}` over the exact
+bytes, with no pre-hash. For a topology transaction that is the full 34-byte multihash
+(`1220…`). This is what the gateway sends; `kind: Hash` would truncate it.
+
+A `Pending` or `Executing` signature (approval policy) is polled for up to `--timeout`
+seconds (600 by default). After a timeout or an approval, rerun with
+`--signature-id sig-…`: this reuses the signature request instead of creating a new one.
+`Rejected`/`Failed` signatures, and signatures that do not verify, stop the command before
+anything is written.
+
+### Runbook: DNS party with a DFNS signing key (DevNet)
+
+```bash
+# 1. owners, each on their own machine (offline keys)
+cdz --env own-a.env keys generate --role ns --name own-a --env-out own-a.env --pub-out own-a.pub.json   # also own-b, own-c
+# 2. signing key in DFNS (operator with dfns-key-admin credentials in dfns.env)
+cdz --env dfns.env dfns keys list --wallets                   # what the gateway will see
+cdz --env dfns.env dfns keys create --name dfns-dns-1-tx --pub-out dfns-tx.pub.json   # note "id" and "fingerprint"
+# 3. coordinator: party definition and onboarding bundle
+cdz status                                                    # participant uid, synchronizer -> CDZ_SYNCHRONIZER_ID
+cdz party new --hint dfns-dns-1 \
+  --owner own-a.pub.json --owner own-b.pub.json --owner own-c.pub.json --owners-threshold 2 \
+  --signing-key dfns-tx.pub.json --signing-threshold 1 \
+  --host <participant uid> --confirmation-threshold 1
+cdz party onboard-bundle -o onboard.json
+# 4. signatures: every owner (DNS creation needs all), DFNS for the proof of ownership
+cdz --env own-a.env bundle sign onboard.json -o onboard.own-a.json --roles ns   # also own-b, own-c
+cdz --env dfns.env dfns sign-bundle onboard.json --key-id key-… -o onboard.dfns.json
+cdz bundle merge onboard.signed.json onboard.own-*.json onboard.dfns.json
+cdz bundle show onboard.signed.json                           # "status: fully signed", p2p signed by dfns-dns-1-tx
+# 5. allocate, then rights for the gateway user once the party is active
+cdz party allocate onboard.signed.json --ledger-url <JSON Ledger API>
+cdz party status                                              # Admin API; wait for party_to_participant
+cdz party grant-user --user '<gateway user (auth0 sub)>' --act-as
+# 6. gateway UI: Parties -> Edit -> signing provider dfns -> key dfns-dns-1-tx -> Save, then make it primary.
+#    The wallet namespace must equal "fingerprint" in dfns-tx.pub.json.
+# optional, without the gateway: manual transaction through DFNS
+cdz tx prepare --create <template> --args '{…}' -o t.json
+cdz --env dfns.env dfns sign-bundle t.json --key-id key-… -o t.signed.json
+cdz tx execute t.signed.json
+```
+
+The gateway sends exactly one signature per transaction, so keep `--signing-threshold 1` with
+one DFNS key. m-of-n for transactions then has to come from DFNS policies. The owners' 2-of-3
+still guards every topology change.
+
+### Rotating the DFNS key
+
+The party id does not change; the owners authorize the change and the new key proves
+ownership.
+
+```bash
+cdz --env dfns.env dfns keys create --name dfns-dns-1-tx2 --pub-out dfns-tx2.pub.json
+cdz topology plan-party --add-key dfns-tx2.pub.json --remove-key <old fingerprint> -o rotate.json   # Admin API
+cdz --env own-b.env bundle sign rotate.json -o rotate.own-b.json      # 2 of 3 owners
+cdz --env own-c.env bundle sign rotate.json -o rotate.own-c.json
+cdz --env dfns.env dfns sign-bundle rotate.json --key-id <new key-…> -o rotate.dfns.json
+cdz bundle merge rotate.signed.json rotate.own-*.json rotate.dfns.json
+cdz bundle show rotate.signed.json --live
+cdz topology submit rotate.signed.json
+```
+
+After the rotation:
+
+- Update `signing.keys` in `party.json`. Submission bundles are checked against it.
+- In the gateway, Edit the party and select the new key.
+- Archive the old key in DFNS.
+
+If DFNS is compromised, `--remove-key` alone needs only the owners. Add a key held outside
+DFNS in the same plan.
+
 ## Utilities flows and limits
 
 Every flow below is a single command with the registrar as its only authorizer:
@@ -468,6 +594,7 @@ backend, or a Splice validator.
 | pre-sign checks | a real prepared transaction whose arguments differ from the requested command is refused (`$.id: 'm' != 'different'`) |
 | offline multi-signer flow | separate `.env` per holder; sign copies, merge, submit (CLI e2e) |
 | Utilities commands | **unverified against DA.** Choice and field names match the Utility 0.14.4 models; context/API shapes follow DA's docs; CLI wiring tested with fakes |
+| DFNS (`cdz dfns`) | **mock DFNS only, no real API call.** DNS party with a "DFNS" signing key onboarded, transacted and rotated e2e against a local DFNS fake that enforces User Action Signing. Request shapes follow docs.dfns.co and @dfns/sdk 0.8.31 / dfns-sdk 1.0.3; client data is byte-identical to the documented example |
 | Admin API TLS, OAuth2 tokens, ACS replication | not tested |
 
 ## Development
@@ -489,6 +616,7 @@ Layout of `src/cdz`:
 - `tx_hash` and `prepared`: interactive-submission hashing and checks.
 - `manage`: change planning.
 - `ledger` and `admin`: API clients.
+- `dfns` and `dfns_cli`: DFNS Keys API client and `cdz dfns`.
 - `utilities`, `registry` and `registrar_cli`: DA Utilities.
 
 References:
