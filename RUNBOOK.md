@@ -42,6 +42,21 @@ cdz tx execute $B.signed.json
 
 Accept before the transfer's `executeBefore` (shown by `--dry-run`).
 
+### Example: set a registrar flag (`RegistrarService_Set`)
+
+```bash
+RS=$(cdz registrar contracts | jq -r '.registrar_service[0].contract_id')   # current RegistrarService cid
+cdz tx prepare --exercise '#utility-registry-app-v0:Utility.Registry.App.V0.Service.Registrar:RegistrarService' \
+  --cid "$RS" --choice RegistrarService_Set \
+  --args '{"enableResultContracts": false}' -o set-erc.json                  # true to enable
+cdz dfns sign-bundle set-erc.json --key-id $DFNS_KEY -o set-erc.signed.json
+cdz tx execute set-erc.signed.json
+cdz registrar contracts                                                       # new RegistrarService cid
+```
+
+`RegistrarService_Set` archives the RegistrarService and creates a new one, so look up the cid right before every
+prepare.
+
 ## 2. Topology transactions (Admin API)
 
 Plan, each required key signs its own copy, merge, check, submit, update `party.json`.
